@@ -147,6 +147,8 @@ function normalize_source_type(source_type)
         return 'NETEZZA'
     elseif source == 'ACTIAN' or source == 'ACTIAN_VECTOR' then
         return 'VECTORWISE'
+    elseif source == 'PRESTO' or source == 'PRESTODB' then
+        return 'TRINO'
     end
 
     return source
@@ -467,6 +469,14 @@ elseif source == 'VECTORWISE' then
     adapter_sql = 'EXECUTE SCRIPT database_migration.VECTORWISE_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'TRINO' then
+    adapter_sql = 'EXECUTE SCRIPT database_migration.TRINO_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'S3' then

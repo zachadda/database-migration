@@ -159,6 +159,7 @@ default_case("TERADATA", "EXECUTE SCRIPT database_migration.TERADATA_TO_EXASOL('
 default_case("EXASOL", "EXECUTE SCRIPT database_migration.EXASOL_TO_EXASOL('SRC_CONN','JDBC',TRUE,'SCH','TBL','FALSE','%','DISABLE')")
 default_case("NETEZZA", "EXECUTE SCRIPT database_migration.NETEZZA_TO_EXASOL('SRC_CONN','DB','SCH','TBL',TRUE)")
 default_case("VECTORWISE", "EXECUTE SCRIPT database_migration.VECTORWISE_TO_EXASOL('SRC_CONN',TRUE,'TBL')")
+default_case("TRINO", "EXECUTE SCRIPT database_migration.TRINO_TO_EXASOL('SRC_CONN',TRUE,'DB','SCH','TBL')")
 
 print("")
 print("=== Alias And Option Tests ===")
@@ -172,6 +173,16 @@ test("source aliases normalize before dispatch", function()
         target_schema = "DST",
     })
     assert_eq(result.adapter_sql, "EXECUTE SCRIPT database_migration.SQLSERVER_TO_EXASOL('SRC_CONN',FALSE,'DB','SCH','DST','TBL',TRUE)")
+end)
+
+test("Presto aliases normalize to Trino dispatch", function()
+    local result = run_migrate({
+        source_type = "presto",
+        db_filter = "memory",
+        schema_filter = "SCH",
+        table_filter = "TBL",
+    })
+    assert_eq(result.adapter_sql, "EXECUTE SCRIPT database_migration.TRINO_TO_EXASOL('SRC_CONN',TRUE,'memory','SCH','TBL')")
 end)
 
 test("Databricks aliases normalize before dispatch", function()
