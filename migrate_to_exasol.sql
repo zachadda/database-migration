@@ -469,6 +469,14 @@ elseif source == 'VECTORWISE' then
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(table_filter) .. ')'
 
+elseif source == 'DREMIO' then
+    adapter_sql = 'EXECUTE SCRIPT database_migration.DREMIO_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
 elseif source == 'S3' then
     error('S3 is not supported by MIGRATE_TO_EXASOL. Use DATABASE_MIGRATION.S3_PARALLEL_READ directly.')
 
