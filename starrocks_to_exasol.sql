@@ -41,10 +41,29 @@ suc, res = pquery([[
 with vv_starrocks_columns as (
     select ]]..exa_upper_begin..[[table_catalog]]..exa_upper_end..[[ as "exa_table_catalog", ]]..exa_upper_begin..[[table_schema]]..exa_upper_end..[[ as "exa_table_schema", ]]..exa_upper_begin..[[table_name]]..exa_upper_end..[[ as "exa_table_name", ]]..exa_upper_begin..[[column_name]]..exa_upper_end..[[ as "exa_column_name", starrocks.* from
     ( import from jdbc at ]]..CONNECTION_NAME..[[ statement
-        'select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, case when is_nullable=''NO'' then ''NOT NULL'' else ''NULL'' end as NOT_NULL_CONSTRAINT, lower(data_type) as data_type, column_type, character_maximum_length, numeric_precision, numeric_scale
-           from information_schema.columns join information_schema.tables using (table_catalog, table_schema, table_name)
-          where table_type in (''BASE TABLE'', ''VIEW'')
-            AND table_schema not in (''information_schema'', ''_statistics_'', ''sys'')
+        '-- StarRocks MySQL-protocol JDBC returns information_schema columns
+         -- in lower case; Exasol IMPORT preserves the case it receives and
+         -- unquoted outer refs would normalize to upper case, so force
+         -- upper here with quoted aliases.
+         select table_catalog            as `TABLE_CATALOG`,
+                table_schema             as `TABLE_SCHEMA`,
+                table_name               as `TABLE_NAME`,
+                column_name              as `COLUMN_NAME`,
+                ordinal_position         as `ORDINAL_POSITION`,
+                column_default           as `COLUMN_DEFAULT`,
+                case when is_nullable = ''NO'' then ''NOT NULL'' else ''NULL'' end as `NOT_NULL_CONSTRAINT`,
+                lower(data_type)         as `DATA_TYPE`,
+                column_type              as `COLUMN_TYPE`,
+                character_maximum_length as `CHARACTER_MAXIMUM_LENGTH`,
+                numeric_precision        as `NUMERIC_PRECISION`,
+                numeric_scale            as `NUMERIC_SCALE`
+           from information_schema.columns
+          -- StarRocks: do NOT join information_schema.tables here. In some
+          -- versions the table_catalog column reports different values
+          -- across the two views (`default_catalog` in tables vs NULL/empty
+          -- in columns), which makes the USING(...) join drop user rows.
+          -- Excluding the three known system schemas is sufficient here.
+          where table_schema not in (''information_schema'', ''_statistics_'', ''sys'')
             AND table_schema like '']]..SCHEMA_FILTER..[[''
             AND table_name like '']]..TABLE_FILTER..[[''
         '
