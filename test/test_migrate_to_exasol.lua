@@ -159,6 +159,7 @@ default_case("TERADATA", "EXECUTE SCRIPT database_migration.TERADATA_TO_EXASOL('
 default_case("EXASOL", "EXECUTE SCRIPT database_migration.EXASOL_TO_EXASOL('SRC_CONN','JDBC',TRUE,'SCH','TBL','FALSE','%','DISABLE')")
 default_case("NETEZZA", "EXECUTE SCRIPT database_migration.NETEZZA_TO_EXASOL('SRC_CONN','DB','SCH','TBL',TRUE)")
 default_case("VECTORWISE", "EXECUTE SCRIPT database_migration.VECTORWISE_TO_EXASOL('SRC_CONN',TRUE,'TBL')")
+default_case("CLICKHOUSE", "EXECUTE SCRIPT database_migration.CLICKHOUSE_TO_EXASOL('SRC_CONN',TRUE,'SCH','TBL')")
 
 print("")
 print("=== Alias And Option Tests ===")
