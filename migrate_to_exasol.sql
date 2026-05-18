@@ -328,7 +328,7 @@ end
 SOURCE_METADATA_BY_SOURCE = {
     ORACLE = {
         mode = 'sql',
-        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from all_tables where (<PREDICATE>)",
+        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(2000000)) /* src_partitions */ from all_tables where (<PREDICATE>)",
         pair = "(owner = '%s' and table_name = '%s')",
     },
     POSTGRES = {
@@ -409,7 +409,7 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     VERTICA = {
         mode = 'sql',
-        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from projection_storage where (<PREDICATE>)",
+        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(2000000)) /* src_partitions */ from projection_storage where (<PREDICATE>)",
         pair = "(projection_schema = '%s' and anchor_table_name = '%s')",
     },
     DB2 = {
@@ -434,7 +434,7 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     DATABRICKS = {
         mode = 'sql',
-        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from information_schema.tables where (<PREDICATE>)",
+        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(2000000)) /* src_partitions */ from information_schema.tables where (<PREDICATE>)",
         pair = "(table_schema = '%s' and table_name = '%s')",
     },
 }
