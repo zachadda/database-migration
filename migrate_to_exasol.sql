@@ -333,6 +333,7 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     POSTGRES = {
         mode = 'sql',
+        needs_min_max_pass = true,
         template = "select n.nspname, c.relname, c.reltuples::bigint,"
             .. " (select a.attname::text from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = con.conkey[1] where con.conrelid = c.oid and con.contype = 'p' and array_length(con.conkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) limit 1),"
             .. " (select format_type(a.atttypid, a.atttypmod) from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = con.conkey[1] where con.conrelid = c.oid and con.contype = 'p' and array_length(con.conkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) limit 1),"
@@ -349,6 +350,7 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     MYSQL = {
         mode = 'sql',
+        needs_min_max_pass = true,
         template = "select t.table_schema, t.table_name, t.table_rows,"
             .. " (select kcu.column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name join information_schema.columns col on col.table_schema = kcu.table_schema and col.table_name = kcu.table_name and col.column_name = kcu.column_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name and col.data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') and kcu.constraint_name in (select constraint_name from information_schema.key_column_usage where table_schema = t.table_schema and table_name = t.table_name group by constraint_name having count(*) = 1) limit 1),"
             .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select kcu.column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name limit 1) limit 1),"
@@ -365,6 +367,7 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     SQLSERVER = {
         mode = 'sql',
+        needs_min_max_pass = true,
         template = "select s.name as src_schema, t.name as src_table, sum(ps.row_count) as src_rows,"
             .. " (select top 1 c2.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_primary_key = 1 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_pk_col,"
             .. " (select top 1 ty.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_primary_key = 1 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_pk_type,"
@@ -816,6 +819,102 @@ local function populate_cache_from_result(lookup_res)
     return rows
 end
 
+-- Builds dialect-specific identifier quoting for min/max round-trip.
+function quote_identifier(source_type, identifier)
+    if source_type == 'POSTGRES' then
+        return '"' .. tostring(identifier):gsub('"', '""') .. '"'
+    elseif source_type == 'MYSQL' or source_type == 'MARIADB' then
+        return '`' .. tostring(identifier):gsub('`', '``') .. '`'
+    elseif source_type == 'SQLSERVER' or source_type == 'AZURE_SQL' then
+        return '[' .. tostring(identifier):gsub(']', ']]') .. ']'
+    end
+    -- Fallback for unknown sources (should not occur for Tier-0)
+    return tostring(identifier)
+end
+
+-- Builds the min/max UNION ALL query for Tier-0 sources.
+-- Input: list of {schema, table, pk_col} tuples that have numeric PKs
+-- Output: UNION ALL'd min/max SELECT statements
+function build_minmax_sql(source_type, minmax_tuples)
+    if minmax_tuples == nil or #minmax_tuples == 0 then
+        return nil
+    end
+
+    local branches = {}
+    for _, tuple in ipairs(minmax_tuples) do
+        local schema_quoted = quote_identifier(source_type, tuple.schema)
+        local table_quoted = quote_identifier(source_type, tuple.table)
+        local pk_quoted = quote_identifier(source_type, tuple.pk_col)
+
+        local branch = string.format("SELECT %s AS src_schema, %s AS src_table, MIN(%s) AS src_pk_min, MAX(%s) AS src_pk_max FROM %s.%s",
+            sql_string(tuple.schema),
+            sql_string(tuple.table),
+            pk_quoted,
+            pk_quoted,
+            schema_quoted,
+            table_quoted)
+
+        branches[#branches + 1] = branch
+    end
+
+    if #branches == 0 then
+        return nil
+    end
+
+    return table.concat(branches, '\nUNION ALL\n')
+end
+
+-- Collects (schema, table, pk_col) tuples from first-pass result that need min/max.
+function collect_minmax_tuples(first_pass_rows)
+    local tuples = {}
+    for _, row in ipairs(first_pass_rows) do
+        local schema = nullify(row.SRC_SCHEMA or row[1])
+        local table_name = nullify(row.SRC_TABLE or row[2])
+        local pk_col = nullify(row.SRC_PK_COL or row[4])
+        local pk_type = nullify(row.SRC_PK_TYPE or row[5])
+
+        -- Only include if we have a numeric PK
+        if schema ~= nil and table_name ~= nil and pk_col ~= nil and is_numeric_pk_type(pk_type) then
+            tuples[#tuples + 1] = {
+                schema = schema,
+                table = table_name,
+                pk_col = pk_col,
+            }
+        end
+    end
+    return tuples
+end
+
+-- Merges min/max results into existing cache rows via LEFT JOIN semantics.
+function merge_minmax_into_cache(cache_rows, minmax_rows, source_type)
+    local minmax_index = {}
+
+    -- Build index of min/max results keyed on (schema, table)
+    for _, row in ipairs(minmax_rows) do
+        local schema = nullify(row.SRC_SCHEMA or row[1])
+        local table_name = nullify(row.SRC_TABLE or row[2])
+        local pk_min = nullify(row.SRC_PK_MIN or row[3])
+        local pk_max = nullify(row.SRC_PK_MAX or row[4])
+
+        if schema ~= nil and table_name ~= nil then
+            local key = schema .. '\t' .. table_name
+            minmax_index[key] = {
+                src_pk_min = pk_min,
+                src_pk_max = pk_max,
+            }
+        end
+    end
+
+    -- LEFT JOIN: update cache rows where match found, leave NULL where no match
+    for key, cache_row in pairs(cache_rows) do
+        local minmax = minmax_index[key]
+        if minmax ~= nil then
+            cache_row.src_pk_min = minmax.src_pk_min
+            cache_row.src_pk_max = minmax.src_pk_max
+        end
+    end
+end
+
 function transform_for_metadata(res, source_type, connection_name, options)
     local empty = { available = false, rows = {}, info_rows = {} }
     if res == nil or #res == 0 then return empty end
@@ -883,7 +982,7 @@ function transform_for_metadata(res, source_type, connection_name, options)
         return { available = true, rows = merged_rows, info_rows = info_rows }
     end
 
-    -- Shared (default) path: one round-trip per migration.
+    -- Shared (default) path: one or two round-trips per migration.
     local pair_clauses = {}
     for _, p in ipairs(pair_list) do
         pair_clauses[#pair_clauses + 1] = string.format(dispatch.pair,
@@ -909,7 +1008,57 @@ function transform_for_metadata(res, source_type, connection_name, options)
     end
 
     local rows = populate_cache_from_result(lookup_res)
-    return { available = true, rows = rows, info_rows = {} }
+    local info_rows = {}
+
+    -- Second-pass min/max round-trip for Tier-0 sources when needed.
+    if dispatch.needs_min_max_pass then
+        -- Check if gate + splitter are both disabled; if so, skip second-pass.
+        local threshold = parse_threshold(options)
+        local splitter_active = splitter_potentially_active(options)
+
+        local should_skip_minmax = (threshold <= 0 and not splitter_active)
+
+        if not should_skip_minmax then
+            -- Collect (schema, table, pk_col) tuples from first-pass that need min/max
+            local minmax_tuples = collect_minmax_tuples(lookup_res)
+
+            if minmax_tuples and #minmax_tuples > 0 then
+                local minmax_sql = build_minmax_sql(source_type, minmax_tuples)
+                if minmax_sql ~= nil then
+                    local minmax_outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_pk_min decimal(36,0), src_pk_max decimal(36,0)) from jdbc at "
+                        .. connection_name
+                        .. " statement '"
+                        .. escape_sql_literal(minmax_sql)
+                        .. "')"
+
+                    -- Soft-fail: wrap in pcall to catch permission-denied, table-missing, etc.
+                    local minmax_pcall_ok, minmax_query_success, minmax_lookup_res = pcall(pquery, minmax_outer_sql)
+
+                    if minmax_pcall_ok then
+                        -- pcall succeeded, so minmax_query_success is the bool from pquery
+                        if minmax_query_success then
+                            -- LEFT JOIN min/max into cache rows
+                            merge_minmax_into_cache(rows, minmax_lookup_res, source_type)
+                        else
+                            -- Min/max query failed; emit INFO row for each table that had a numeric PK
+                            local err = (minmax_lookup_res and minmax_lookup_res.error_message) or 'unknown error'
+                            for _, tuple in ipairs(minmax_tuples) do
+                                info_rows[#info_rows + 1] = '-- second-pass min/max round-trip failed for ' .. tuple.schema .. '.' .. tuple.table .. ': ' .. tostring(err)
+                            end
+                        end
+                    else
+                        -- pcall itself failed (should not happen in normal operation)
+                        local pcall_err = tostring(minmax_query_success)  -- second arg is error message
+                        for _, tuple in ipairs(minmax_tuples) do
+                            info_rows[#info_rows + 1] = '-- second-pass min/max round-trip error for ' .. tuple.schema .. '.' .. tuple.table .. ': ' .. pcall_err
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return { available = true, rows = rows, info_rows = info_rows }
 end
 
 function raw_parallel_requested(options)

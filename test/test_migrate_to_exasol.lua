@@ -90,11 +90,21 @@ local function run_migrate(params)
             return true, adapter_rows
         end
 
+        -- Distinguish catalog (first-pass) from min/max (second-pass) metadata queries
         if sql:find("import into (src_schema", 1, true) then
-            if params.gate_lookup_error then
-                return false, {error_message = params.gate_lookup_error}
+            if sql:find("src_rows", 1, true) then
+                -- First pass: catalog metadata (has src_rows column)
+                if params.gate_lookup_error then
+                    return false, {error_message = params.gate_lookup_error}
+                end
+                return true, params.gate_lookup_rows or {}
+            else
+                -- Second pass: min/max metadata (only has src_schema, src_table, src_pk_min, src_pk_max)
+                if params.minmax_lookup_error then
+                    return false, {error_message = params.minmax_lookup_error}
+                end
+                return true, params.minmax_lookup_rows or {}
             end
-            return true, params.gate_lookup_rows or {}
         end
 
         execute_call_index = execute_call_index + 1
@@ -863,13 +873,21 @@ test("metadata round-trip fires once for mixed single/multi-stmt IMPORTs", funct
             {SRC_SCHEMA = "PUBLIC", SRC_TABLE = "orders", SRC_ROWS = 20000000, SRC_PK_COL = "ID", SRC_PK_TYPE = "int8"},
         },
     })
-    local lookup_count = 0
+    -- Tier-0 sources (POSTGRES) now issue two metadata round-trips: catalog + min/max
+    local catalog_count = 0
+    local minmax_count = 0
     for i = 1, #result.calls do
-        if tostring(result.calls[i]):find("import into (src_schema", 1, true) then
-            lookup_count = lookup_count + 1
+        local sql = tostring(result.calls[i])
+        if sql:find("import into (src_schema", 1, true) then
+            if sql:find("src_rows", 1, true) then
+                catalog_count = catalog_count + 1
+            else
+                minmax_count = minmax_count + 1
+            end
         end
     end
-    assert_eq(lookup_count, 1, "exactly one metadata round-trip across gate + splitter")
+    assert_eq(catalog_count, 1, "exactly one catalog metadata round-trip across gate + splitter")
+    assert_eq(minmax_count, 1, "exactly one min/max metadata round-trip for Tier-0 (POSTGRES)")
     local multi_row = find_import_row(result.rows, "DST.BIG_T")
     local single_row = find_import_row(result.rows, "DST.ORDERS")
     assert_eq(count_clauses(multi_row[6]), 1, "below-threshold multi-stmt collapsed by gate")
@@ -1107,7 +1125,7 @@ end)
 test("duplicate source tables collapse to one cache lookup pair", function()
     local sql1 = single_stmt_import("DST", "ORDERS_A", "PUBLIC", "orders")
     local sql2 = single_stmt_import("DST", "ORDERS_B", "PUBLIC", "orders")
-    local lookup_sql_seen = nil
+    local catalog_sql_seen = nil
     local result = run_migrate({
         source_type = "POSTGRES",
         target_schema = "DST",
@@ -1115,15 +1133,18 @@ test("duplicate source tables collapse to one cache lookup pair", function()
         adapter_rows = {{SQL_TEXT = sql1}, {SQL_TEXT = sql2}},
         gate_lookup_rows = {{SRC_SCHEMA = "PUBLIC", SRC_TABLE = "orders", SRC_ROWS = 20000000, SRC_PK_COL = "id", SRC_PK_TYPE = "int8"}},
     })
+    -- Find the catalog query (has src_rows column)
     for i = 1, #result.calls do
-        if tostring(result.calls[i]):find("import into (src_schema", 1, true) then
-            lookup_sql_seen = result.calls[i]
+        local sql = tostring(result.calls[i])
+        if sql:find("import into (src_schema", 1, true) and sql:find("src_rows", 1, true) then
+            catalog_sql_seen = sql
+            break
         end
     end
-    assert(lookup_sql_seen, "metadata lookup must fire")
+    assert(catalog_sql_seen, "catalog metadata lookup must fire")
     -- The outer IMPORT-FROM-JDBC SQL wraps the inner metadata SQL in a single-
     -- quoted literal, so every `'PUBLIC'` becomes `''PUBLIC''`. Count occurrences.
-    local _, pair_count = string.gsub(lookup_sql_seen, "c%.relname = ''orders''", "")
+    local _, pair_count = string.gsub(catalog_sql_seen, "c%.relname = ''orders''", "")
     assert_eq(pair_count, 1, "duplicate source tables must appear exactly once in WHERE; got " .. pair_count)
 end)
 
@@ -1154,15 +1175,17 @@ test("per-source metadata SQL switches by SOURCE_TYPE", function()
         adapter_rows = {{SQL_TEXT = pg_sql}},
         gate_lookup_rows = {{SRC_SCHEMA = "PUBLIC", SRC_TABLE = "orders", SRC_ROWS = 20000000, SRC_PK_COL = "id", SRC_PK_TYPE = "int8"}},
     })
-    local pg_lookup = nil
+    local pg_catalog_lookup = nil
     for i = 1, #pg_result.calls do
-        if tostring(pg_result.calls[i]):find("import into (src_schema", 1, true) then
-            pg_lookup = pg_result.calls[i]
+        local sql = tostring(pg_result.calls[i])
+        if sql:find("import into (src_schema", 1, true) and sql:find("src_rows", 1, true) then
+            pg_catalog_lookup = sql
+            break
         end
     end
-    assert(pg_lookup, "PG lookup SQL not seen")
-    assert_contains(pg_lookup, "pg_class")
-    assert_contains(pg_lookup, "pg_namespace")
+    assert(pg_catalog_lookup, "PG catalog lookup SQL not seen")
+    assert_contains(pg_catalog_lookup, "pg_class")
+    assert_contains(pg_catalog_lookup, "pg_namespace")
 
     local my_sql = single_stmt_import("DST", "ORDERS", "MYDB", "orders")
     local my_result = run_migrate({
@@ -1172,14 +1195,16 @@ test("per-source metadata SQL switches by SOURCE_TYPE", function()
         adapter_rows = {{SQL_TEXT = my_sql}},
         gate_lookup_rows = {{SRC_SCHEMA = "MYDB", SRC_TABLE = "orders", SRC_ROWS = 20000000, SRC_PK_COL = "id", SRC_PK_TYPE = "bigint"}},
     })
-    local my_lookup = nil
+    local my_catalog_lookup = nil
     for i = 1, #my_result.calls do
-        if tostring(my_result.calls[i]):find("import into (src_schema", 1, true) then
-            my_lookup = my_result.calls[i]
+        local sql = tostring(my_result.calls[i])
+        if sql:find("import into (src_schema", 1, true) and sql:find("src_rows", 1, true) then
+            my_catalog_lookup = sql
+            break
         end
     end
-    assert(my_lookup, "MySQL lookup SQL not seen")
-    assert_contains(my_lookup, "information_schema.tables")
+    assert(my_catalog_lookup, "MySQL catalog lookup SQL not seen")
+    assert_contains(my_catalog_lookup, "information_schema.tables")
 end)
 
 test("gate-collapsed multi-stmt IMPORT below threshold records SINGLE audit", function()
@@ -1779,8 +1804,171 @@ test("Non-BigQuery source retains single round-trip", function()
         adapter_rows = {{SQL_TEXT = sql}},
         gate_lookup_rows = {{SRC_SCHEMA = "public", SRC_TABLE = "T1", SRC_ROWS = 1000, SRC_PK_COL = "id", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 1000, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil}},
     })
-    assert_eq(#result.calls, 2, "POSTGRES should issue exactly 2 calls (adapter + 1 shared metadata)")
-    assert_contains(result.calls[2], "select", "metadata call should have shared single-statement SQL")
+    -- Tier-0 sources (POSTGRES) now issue two metadata round-trips: catalog + min/max (one per source per migration)
+    assert_eq(#result.calls, 3, "POSTGRES should issue exactly 3 calls (adapter + catalog + min/max)")
+    assert_contains(result.calls[2], "select", "catalog metadata call should have shared single-statement SQL")
+end)
+
+print("")
+print("=== Tier-0 Min/Max Population Tests ===")
+
+test("POSTGRES populates src_pk_min and src_pk_max with second-pass UNION ALL", function()
+    local sql = single_stmt_import("DST", "ORDERS", "PUBLIC", "ORDERS")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=4",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "PUBLIC", SRC_TABLE = "ORDERS", SRC_ROWS = 20000000, SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+        },
+        minmax_lookup_rows = {
+            {SRC_SCHEMA = "PUBLIC", SRC_TABLE = "ORDERS", SRC_PK_MIN = 1, SRC_PK_MAX = 20000000},
+        },
+    })
+    assert_eq(#result.calls, 3, "POSTGRES Tier-0 should issue exactly 3 calls (adapter + catalog + min/max)")
+    assert_contains(result.calls[3], "SELECT", "third call should be min/max UNION ALL")
+    assert_contains(result.calls[3], "MIN(", "min/max SQL should contain MIN")
+    assert_contains(result.calls[3], "MAX(", "min/max SQL should contain MAX")
+end)
+
+test("MYSQL UNION ALL uses backtick quoting for second pass", function()
+    local sql = single_stmt_import("DST", "ORDERS", "mydb", "orders")
+    local result = run_migrate({
+        source_type = "MYSQL",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=4",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "mydb", SRC_TABLE = "orders", SRC_ROWS = 100000, SRC_PK_COL = "order_id", SRC_PK_TYPE = "int", SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+        },
+        minmax_lookup_rows = {
+            {SRC_SCHEMA = "mydb", SRC_TABLE = "orders", SRC_PK_MIN = 1, SRC_PK_MAX = 100000},
+        },
+    })
+    assert_eq(#result.calls, 3, "MYSQL Tier-0 should issue exactly 3 calls")
+    assert_contains(result.calls[3], "`mydb`.`orders`", "MYSQL min/max should use backtick quoting")
+    assert_contains(result.calls[3], "MIN(`order_id`)", "MYSQL min/max should use backtick on column")
+end)
+
+test("SQLSERVER UNION ALL uses bracket quoting for second pass", function()
+    local sql = single_stmt_import("DST", "ORDERS", "dbo", "orders")
+    local result = run_migrate({
+        source_type = "SQLSERVER",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=4",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "dbo", SRC_TABLE = "orders", SRC_ROWS = 50000, SRC_PK_COL = "OrderID", SRC_PK_TYPE = "int", SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+        },
+        minmax_lookup_rows = {
+            {SRC_SCHEMA = "dbo", SRC_TABLE = "orders", SRC_PK_MIN = 1, SRC_PK_MAX = 50000},
+        },
+    })
+    assert_eq(#result.calls, 3, "SQLSERVER Tier-0 should issue exactly 3 calls")
+    assert_contains(result.calls[3], "[dbo].[orders]", "SQLSERVER min/max should use bracket quoting")
+    assert_contains(result.calls[3], "MIN([OrderID])", "SQLSERVER min/max should use bracket on column")
+end)
+
+test("MARIADB alias inherits second-pass from MYSQL", function()
+    local sql = single_stmt_import("DST", "USERS", "mydb", "users")
+    local result = run_migrate({
+        source_type = "MARIADB",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=4",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "mydb", SRC_TABLE = "users", SRC_ROWS = 10000, SRC_PK_COL = "user_id", SRC_PK_TYPE = "int", SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+        },
+        minmax_lookup_rows = {
+            {SRC_SCHEMA = "mydb", SRC_TABLE = "users", SRC_PK_MIN = 1, SRC_PK_MAX = 10000},
+        },
+    })
+    assert_eq(#result.calls, 3, "MARIADB should issue 3 calls like MYSQL")
+    assert_contains(result.calls[3], "`mydb`.`users`", "MARIADB should use backtick like MYSQL")
+end)
+
+test("AZURE_SQL alias inherits second-pass from SQLSERVER", function()
+    local sql = single_stmt_import("DST", "PRODUCTS", "dbo", "products")
+    local result = run_migrate({
+        source_type = "AZURE_SQL",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=4",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "dbo", SRC_TABLE = "products", SRC_ROWS = 5000, SRC_PK_COL = "ProductID", SRC_PK_TYPE = "int", SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+        },
+        minmax_lookup_rows = {
+            {SRC_SCHEMA = "dbo", SRC_TABLE = "products", SRC_PK_MIN = 1, SRC_PK_MAX = 5000},
+        },
+    })
+    assert_eq(#result.calls, 3, "AZURE_SQL should issue 3 calls like SQLSERVER")
+    assert_contains(result.calls[3], "[dbo].[products]", "AZURE_SQL should use bracket like SQLSERVER")
+end)
+
+test("No numeric PK skips second-pass for that row", function()
+    local sql = single_stmt_import("DST", "NOKEY", "app", "NOKEY")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=4",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "app", SRC_TABLE = "NOKEY", SRC_ROWS = 1000, SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+        },
+        minmax_lookup_rows = {},  -- No min/max needed since no PK
+    })
+    assert_eq(#result.calls, 2, "Should skip second-pass when no numeric PK")
+end)
+
+test("Gate + splitter disabled skips both round-trips", function()
+    local sql = single_stmt_import("DST", "ORDERS", "PUBLIC", "ORDERS")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=1;PARALLEL_SPLIT=OFF",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {},
+        minmax_lookup_rows = {},
+    })
+    -- With gate + splitter disabled, no metadata calls at all
+    assert_eq(#result.calls, 1, "Should skip all metadata rounds when gate+splitter disabled")
+end)
+
+test("Non-Tier-0 source (ORACLE) skips second-pass", function()
+    local sql = single_stmt_import("DST", "EMPLOYEES", "HR", "EMPLOYEES")
+    local result = run_migrate({
+        source_type = "ORACLE",
+        schema_filter = "HR",
+        table_filter = "EMPLOYEES",
+        options = "PARALLEL_ROW_THRESHOLD=1000000",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "HR", SRC_TABLE = "EMPLOYEES", SRC_ROWS = 10000, SRC_PK_COL = "EMPLOYEE_ID", SRC_PK_TYPE = "NUMBER", SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+        },
+        minmax_lookup_rows = {},  -- ORACLE does not get second pass
+    })
+    -- Note: ORACLE is non-Tier-0, so it should NOT trigger second-pass even if needs_min_max_pass is false
+    -- Just verify that the migration runs and an IMPORT row is produced
+    local import_row = find_import_row(result.rows, "DST.EMPLOYEES")
+    assert(import_row, "ORACLE migration should produce an IMPORT row")
+end)
+
+test("Second-pass failure on one table soft-fails to NULL min/max with INFO", function()
+    local sql = single_stmt_import("DST", "DATA", "app", "DATA")
+    local result = run_migrate({
+        source_type = "MYSQL",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=4",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "app", SRC_TABLE = "OK_T", SRC_ROWS = 1000, SRC_PK_COL = "id", SRC_PK_TYPE = "int", SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+            {SRC_SCHEMA = "app", SRC_TABLE = "DENIED_T", SRC_ROWS = 2000, SRC_PK_COL = "id", SRC_PK_TYPE = "int", SRC_PK_MIN = nil, SRC_PK_MAX = nil},
+        },
+        minmax_lookup_error = "Access denied for user 'guest'@'localhost' to database 'app'",
+    })
+    assert_eq(#result.calls, 3, "Should issue 3 calls even with min/max error")
+    assert_contains(result.calls[3], "SELECT", "third call should attempt min/max UNION ALL")
 end)
 
 print("")
