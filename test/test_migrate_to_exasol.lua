@@ -1388,6 +1388,139 @@ test("PK_RANGE BETWEEN SQL Server bracket quoting", function()
     assert_contains(row[6], '[Id] BETWEEN 1 AND 50', "SQL Server should use bracket BETWEEN")
 end)
 
+-- UNIQUE_NUM tests (new strategy, item 3)
+
+test("UNIQUE_NUM: AUTO picks UNIQUE_NUM when no PK but unique numeric col present", function()
+    local sql = single_stmt_import("DST", "LEGACY_ORDERS", "PUB", "LEGACY_ORDERS")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "LEGACY_ORDERS", SRC_ROWS = 1000,
+            SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil,
+            SRC_UNIQUE_NUM_COL = "LEGACY_ID", SRC_UNIQUE_NUM_TYPE = "INT4", SRC_UNIQUE_NUM_MIN = 1, SRC_UNIQUE_NUM_MAX = 2000000,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.LEGACY_ORDERS")
+    assert(row, "IMPORT row missing")
+    assert_eq(count_clauses(row[6]), 4, "expected 4 BETWEEN clauses")
+    assert_contains(row[6], '"LEGACY_ID" BETWEEN', "should use BETWEEN on unique col")
+    assert_eq(row[8], "UNIQUE_NUM", "SPLIT_STRATEGY should be UNIQUE_NUM")
+    assert_eq(row[9], "LEGACY_ID", "SPLIT_KEY should be LEGACY_ID")
+end)
+
+test("UNIQUE_NUM: AUTO falls through to DATE_BUCKET when no PK and no unique-num", function()
+    local sql = single_stmt_import("DST", "LOGS", "PUB", "LOGS")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "LOGS", SRC_ROWS = 1000,
+            SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = "TS", SRC_NUM_COL = nil, SRC_PARTITIONED = false
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.LOGS")
+    assert_eq(row[8], "DATE_BUCKET", "SPLIT_STRATEGY should fall through to DATE_BUCKET")
+    assert_eq(row[9], "TS", "SPLIT_KEY should be TS")
+end)
+
+test("UNIQUE_NUM: Forced PARALLEL_SPLIT=UNIQUE_NUM uses cached column", function()
+    local sql = single_stmt_import("DST", "HYBRID_T", "PUB", "HYBRID_T")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=2;PARALLEL_SPLIT=UNIQUE_NUM",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "HYBRID_T", SRC_ROWS = 1000,
+            SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 1000,
+            SRC_UNIQUE_NUM_COL = "TRACE_NUM", SRC_UNIQUE_NUM_TYPE = "INT4", SRC_UNIQUE_NUM_MIN = 1, SRC_UNIQUE_NUM_MAX = 100,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.HYBRID_T")
+    assert_eq(count_clauses(row[6]), 2, "expected 2 BETWEEN clauses")
+    assert_contains(row[6], '"TRACE_NUM" BETWEEN', "should use TRACE_NUM not ID")
+    assert_eq(row[8], "UNIQUE_NUM", "SPLIT_STRATEGY should be UNIQUE_NUM")
+    assert_eq(row[9], "TRACE_NUM", "SPLIT_KEY should be TRACE_NUM")
+end)
+
+test("UNIQUE_NUM: Forced PARALLEL_SPLIT=UNIQUE_NUM:col overrides cached column", function()
+    local sql = single_stmt_import("DST", "OPS_AUDIT", "PUB", "OPS_AUDIT")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=UNIQUE_NUM:OPS_SEQ",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "OPS_AUDIT", SRC_ROWS = 1000,
+            SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.OPS_AUDIT")
+    assert_eq(count_clauses(row[6]), 4, "expected 4 clauses (MOD fallback, no lo/hi)")
+    assert_contains(row[6], 'MOD("OPS_SEQ", 4)', "should use MOD on operator-supplied column")
+    assert_eq(row[8], "UNIQUE_NUM", "SPLIT_STRATEGY should be UNIQUE_NUM")
+end)
+
+test("UNIQUE_NUM: Forced UNIQUE_NUM soft-fails when no col known and no override supplied", function()
+    local sql = single_stmt_import("DST", "MYSTERY_T", "PUB", "MYSTERY_T")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=UNIQUE_NUM",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "MYSTERY_T", SRC_ROWS = 1000,
+            SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.MYSTERY_T")
+    assert(row, "IMPORT row must be present (soft-fail)")
+    assert_eq(count_clauses(row[6]), 1, "should pass through unchanged (single statement)")
+    assert_eq(row[8], "SINGLE", "SPLIT_STRATEGY should be SINGLE (soft-fail)")
+    -- verify INFO row was emitted
+    local has_info = false
+    for _, r in ipairs(result.rows) do
+        if r[1] == "INFO" and r[7] and r[7]:find("PARALLEL_SPLIT=UNIQUE_NUM") then
+            has_info = true
+            break
+        end
+    end
+    assert(has_info, "INFO audit row missing for soft-fail")
+end)
+
+test("UNIQUE_NUM: MOD fallback when src_unique_num_min/max NULL", function()
+    local sql = single_stmt_import("DST", "legacy_data", "app", "legacy_data")
+    local result = run_migrate({
+        source_type = "MYSQL",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "app", SRC_TABLE = "legacy_data", SRC_ROWS = 1000,
+            SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil,
+            SRC_UNIQUE_NUM_COL = "LEGACY_ID", SRC_UNIQUE_NUM_TYPE = "int", SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.legacy_data")
+    assert_eq(count_clauses(row[6]), 4, "expected 4 MOD clauses (no lo/hi)")
+    assert_contains(row[6], '(`LEGACY_ID` MOD 4) = 0', "should use MySQL backtick MOD fallback")
+    assert_eq(row[8], "UNIQUE_NUM", "SPLIT_STRATEGY should be UNIQUE_NUM")
+end)
+
 print("")
 print(string.format("=== Results: %d passed, %d failed ===", passed, failed))
 

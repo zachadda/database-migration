@@ -328,7 +328,7 @@ end
 SOURCE_METADATA_BY_SOURCE = {
     ORACLE = {
         mode = 'sql',
-        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL from all_tables where (<PREDICATE>)",
+        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from all_tables where (<PREDICATE>)",
         pair = "(owner = '%s' and table_name = '%s')",
     },
     POSTGRES = {
@@ -336,6 +336,9 @@ SOURCE_METADATA_BY_SOURCE = {
         template = "select n.nspname, c.relname, c.reltuples::bigint,"
             .. " (select a.attname::text from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = con.conkey[1] where con.conrelid = c.oid and con.contype = 'p' and array_length(con.conkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) limit 1),"
             .. " (select format_type(a.atttypid, a.atttypmod) from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = con.conkey[1] where con.conrelid = c.oid and con.contype = 'p' and array_length(con.conkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) limit 1),"
+            .. " NULL, NULL,"
+            .. " (select a.attname::text from pg_attribute a join pg_index idx on idx.indrelid = a.attrelid and a.attnum = ANY(idx.indkey) where a.attrelid = c.oid and idx.indisunique and NOT idx.indisprimary and array_length(idx.indkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) order by idx.indexrelid limit 1),"
+            .. " (select format_type(a.atttypid, a.atttypmod) from pg_attribute a join pg_index idx on idx.indrelid = a.attrelid and a.attnum = ANY(idx.indkey) where a.attrelid = c.oid and idx.indisunique and NOT idx.indisprimary and array_length(idx.indkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) order by idx.indexrelid limit 1),"
             .. " NULL, NULL,"
             .. " (select a.attname::text from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.atttypid in (1082, 1114, 1184) order by (case when a.attname ~* '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), a.attnum limit 1),"
             .. " (select a.attname::text from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.attnotnull and a.atttypid in (20, 21, 23, 700, 701, 1700) order by a.attnum limit 1),"
@@ -349,6 +352,9 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " (select kcu.column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name join information_schema.columns col on col.table_schema = kcu.table_schema and col.table_name = kcu.table_name and col.column_name = kcu.column_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name and col.data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') and kcu.constraint_name in (select constraint_name from information_schema.key_column_usage where table_schema = t.table_schema and table_name = t.table_name group by constraint_name having count(*) = 1) limit 1),"
             .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select kcu.column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name limit 1) limit 1),"
             .. " NULL, NULL,"
+            .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') and is_nullable = 'NO' and column_name not in (select column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name) and column_name in (select column_name from information_schema.statistics where table_schema = t.table_schema and table_name = t.table_name and non_unique = 0 and seq_in_index = 1) limit 1),"
+            .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') and is_nullable = 'NO' and column_name not in (select column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name) and column_name in (select column_name from information_schema.statistics where table_schema = t.table_schema and table_name = t.table_name and non_unique = 0 and seq_in_index = 1) limit 1) limit 1),"
+            .. " NULL, NULL,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('date','datetime','timestamp') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1),"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') order by ordinal_position limit 1),"
             .. " (select count(*) > 0 from information_schema.partitions where table_schema = t.table_schema and table_name = t.table_name and partition_name is not null)"
@@ -360,6 +366,9 @@ SOURCE_METADATA_BY_SOURCE = {
         template = "select s.name as src_schema, t.name as src_table, sum(ps.row_count) as src_rows,"
             .. " (select top 1 c2.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_primary_key = 1 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_pk_col,"
             .. " (select top 1 ty.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_primary_key = 1 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_pk_type,"
+            .. " NULL, NULL,"
+            .. " (select top 1 c2.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_unique = 1 and i.is_primary_key = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_unique_num_col,"
+            .. " (select top 1 ty.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_unique = 1 and i.is_primary_key = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_unique_num_type,"
             .. " NULL, NULL,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and ty.name in ('date','datetime','datetime2','smalldatetime','datetimeoffset','time') order by (case when lower(c2.name) like '%date' or lower(c2.name) like '%dt' or lower(c2.name) like '%time' or lower(c2.name) like '%day' or lower(c2.name) like '%created' or lower(c2.name) like '%loaded' or lower(c2.name) like '%event' or lower(c2.name) like '%posted' then 0 else 1 end), c2.column_id) as src_date_col,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and c2.is_nullable = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') order by c2.column_id) as src_num_col,"
@@ -373,6 +382,7 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " (select kcu.column_name from information_schema.table_constraints tc join information_schema.key_column_usage kcu on kcu.constraint_name = tc.constraint_name and kcu.table_schema = tc.table_schema and kcu.table_name = tc.table_name join information_schema.columns col on col.table_schema = kcu.table_schema and col.table_name = kcu.table_name and col.column_name = kcu.column_name where tc.constraint_type = 'PRIMARY KEY' and tc.table_schema = t.table_schema and tc.table_name = t.table_name and col.data_type in ('NUMBER','DECIMAL','FLOAT','REAL','DOUBLE','INTEGER','BIGINT','SMALLINT','TINYINT','BYTEINT') and (select count(*) from information_schema.key_column_usage k2 where k2.constraint_name = tc.constraint_name and k2.table_schema = tc.table_schema and k2.table_name = tc.table_name) = 1 limit 1) as src_pk_col,"
             .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select kcu.column_name from information_schema.table_constraints tc join information_schema.key_column_usage kcu on kcu.constraint_name = tc.constraint_name and kcu.table_schema = tc.table_schema and kcu.table_name = tc.table_name where tc.constraint_type = 'PRIMARY KEY' and tc.table_schema = t.table_schema and tc.table_name = t.table_name limit 1) limit 1) as src_pk_type,"
             .. " NULL, NULL,"
+            .. " NULL, NULL, NULL, NULL,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('DATE','TIMESTAMP','TIMESTAMP_LTZ','TIMESTAMP_NTZ','TIMESTAMP_TZ','DATETIME','TIME') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1) as src_date_col,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('NUMBER','DECIMAL','FLOAT','REAL','DOUBLE','INTEGER','BIGINT','SMALLINT','TINYINT','BYTEINT') order by ordinal_position limit 1) as src_num_col,"
             .. " FALSE as src_partitioned"
@@ -385,37 +395,37 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     REDSHIFT = {
         mode = 'sql',
-        template = [[select "schema", "table", tbl_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL from svv_table_info where (<PREDICATE>)]],
+        template = [[select "schema", "table", tbl_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from svv_table_info where (<PREDICATE>)]],
         pair = [[("schema" = '%s' and "table" = '%s')]],
     },
     VERTICA = {
         mode = 'sql',
-        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL from projection_storage where (<PREDICATE>)",
+        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from projection_storage where (<PREDICATE>)",
         pair = "(projection_schema = '%s' and anchor_table_name = '%s')",
     },
     DB2 = {
         mode = 'sql',
-        template = "select tabschema, tabname, card, NULL, NULL, NULL, NULL, NULL, NULL, NULL from syscat.tables where (<PREDICATE>)",
+        template = "select tabschema, tabname, card, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from syscat.tables where (<PREDICATE>)",
         pair = "(tabschema = '%s' and tabname = '%s')",
     },
     HANA = {
         mode = 'sql',
-        template = "select schema_name, table_name, record_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL from sys.m_tables where (<PREDICATE>)",
+        template = "select schema_name, table_name, record_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from sys.m_tables where (<PREDICATE>)",
         pair = "(schema_name = '%s' and table_name = '%s')",
     },
     NETEZZA = {
         mode = 'sql',
-        template = [[select schema, tablename, reltuples, NULL, NULL, NULL, NULL, NULL, NULL, NULL from _v_table where (<PREDICATE>)]],
+        template = [[select schema, tablename, reltuples, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from _v_table where (<PREDICATE>)]],
         pair = [[(schema = '%s' and tablename = '%s')]],
     },
     TERADATA = {
         mode = 'sql',
-        template = "select databasename, tablename, currentpermspace, NULL, NULL, NULL, NULL, NULL, NULL, NULL from dbc.tablesizev where (<PREDICATE>)",
+        template = "select databasename, tablename, currentpermspace, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from dbc.tablesizev where (<PREDICATE>)",
         pair = "(databasename = '%s' and tablename = '%s')",
     },
     DATABRICKS = {
         mode = 'sql',
-        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL from information_schema.tables where (<PREDICATE>)",
+        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from information_schema.tables where (<PREDICATE>)",
         pair = "(table_schema = '%s' and table_name = '%s')",
     },
 }
@@ -707,7 +717,7 @@ function transform_for_metadata(res, source_type, connection_name, options)
     local predicate = table.concat(pair_clauses, ' or ')
     local metadata_sql = (dispatch.template:gsub('<PREDICATE>', function() return predicate end))
 
-    local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_pk_min decimal(36,0), src_pk_max decimal(36,0), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean) from jdbc at "
+    local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_pk_min decimal(36,0), src_pk_max decimal(36,0), src_unique_num_col varchar(2000), src_unique_num_type varchar(200), src_unique_num_min decimal(36,0), src_unique_num_max decimal(36,0), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean) from jdbc at "
         .. connection_name
         .. " statement '"
         .. escape_sql_literal(metadata_sql)
@@ -742,9 +752,13 @@ function transform_for_metadata(res, source_type, connection_name, options)
                 src_pk_type = nullify(r.SRC_PK_TYPE or r[5]),
                 src_pk_min = nullify(r.SRC_PK_MIN or r[6]),
                 src_pk_max = nullify(r.SRC_PK_MAX or r[7]),
-                src_date_col = nullify(r.SRC_DATE_COL or r[8]),
-                src_num_col = nullify(r.SRC_NUM_COL or r[9]),
-                src_partitioned = nullify(r.SRC_PARTITIONED or r[10]),
+                src_unique_num_col = nullify(r.SRC_UNIQUE_NUM_COL or r[8]),
+                src_unique_num_type = nullify(r.SRC_UNIQUE_NUM_TYPE or r[9]),
+                src_unique_num_min = nullify(r.SRC_UNIQUE_NUM_MIN or r[10]),
+                src_unique_num_max = nullify(r.SRC_UNIQUE_NUM_MAX or r[11]),
+                src_date_col = nullify(r.SRC_DATE_COL or r[12]),
+                src_num_col = nullify(r.SRC_NUM_COL or r[13]),
+                src_partitioned = nullify(r.SRC_PARTITIONED or r[14]),
             }
         end
     end
@@ -819,6 +833,7 @@ function parse_split_directive(options)
     if up == 'PARTITION' then return { mode = 'PARTITION' } end
     if up == 'ROWID' then return { mode = 'ROWID' } end
     if up == 'DATE' then return { mode = 'DATE' } end
+    if up == 'UNIQUE_NUM' then return { mode = 'UNIQUE_NUM' } end
 
     local prefix, rest = raw:match('^([^:]+):(.+)$')
     if prefix and string.upper(prefix) == 'DATE' then
@@ -828,6 +843,9 @@ function parse_split_directive(options)
     end
     if prefix and string.upper(prefix) == 'HASH' then
         return { mode = 'HASH', col = rest }
+    end
+    if prefix and string.upper(prefix) == 'UNIQUE_NUM' then
+        return { mode = 'UNIQUE_NUM', col = rest }
     end
     error('Invalid PARALLEL_SPLIT value: ' .. tostring(raw))
 end
@@ -946,6 +964,14 @@ function pick_split_strategy(meta, options, dialect, source_type)
             end
             return decision
         end
+        if meta.src_unique_num_col and is_numeric_pk_type(meta.src_unique_num_type) then
+            local decision = { strategy = 'UNIQUE_NUM', key = meta.src_unique_num_col }
+            if meta.src_unique_num_min ~= nil and meta.src_unique_num_max ~= nil then
+                decision.lo = meta.src_unique_num_min
+                decision.hi = meta.src_unique_num_max
+            end
+            return decision
+        end
         if meta.src_date_col then
             return { strategy = 'DATE_BUCKET', key = meta.src_date_col }
         end
@@ -986,6 +1012,19 @@ function pick_split_strategy(meta, options, dialect, source_type)
             return { strategy = 'ROWID', key = dialect.rowid_expr }
         end
         return nil, 'PARALLEL_SPLIT=ROWID unsupported for ' .. tostring(source_type)
+    end
+
+    if directive.mode == 'UNIQUE_NUM' then
+        local col = directive.col or (meta and meta.src_unique_num_col)
+        if col == nil then
+            return nil, 'INFO: PARALLEL_SPLIT=UNIQUE_NUM requested but no unique-num col known and no override supplied'
+        end
+        local decision = { strategy = 'UNIQUE_NUM', key = col }
+        if meta and meta.src_unique_num_min ~= nil and meta.src_unique_num_max ~= nil then
+            decision.lo = meta.src_unique_num_min
+            decision.hi = meta.src_unique_num_max
+        end
+        return decision
     end
 
     if directive.mode == 'PARTITION' then
@@ -1267,7 +1306,7 @@ function transform_for_split(res, options, cache, source_type, decisions)
     end
 
     for _, t in ipairs(info_rows) do
-        out[#out + 1] = { SQL_TEXT = t }
+        out[#out + 1] = { SQL_TEXT = t, ERROR_MESSAGE = t:sub(3) }
     end
     return out
 end
