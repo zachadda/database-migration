@@ -360,8 +360,8 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " NULL, NULL,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('date','datetime','timestamp') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1),"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') order by ordinal_position limit 1),"
-            .. " (select count(*) > 0 from information_schema.partitions where table_schema = t.table_schema and table_name = t.table_name and partition_name is not null),"
-            .. " NULL"
+            .. " (case when (select count(*) from information_schema.partitions where table_schema = t.table_schema and table_name = t.table_name and partition_name is not null) > 0 then true else false end),"
+            .. " cast(NULL as char)"
             .. " from information_schema.tables t where (<PREDICATE>)",
         pair = "(t.table_schema = '%s' and t.table_name = '%s')",
     },
@@ -377,8 +377,8 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " NULL, NULL,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and ty.name in ('date','datetime','datetime2','smalldatetime','datetimeoffset','time') order by (case when lower(c2.name) like '%date' or lower(c2.name) like '%dt' or lower(c2.name) like '%time' or lower(c2.name) like '%day' or lower(c2.name) like '%created' or lower(c2.name) like '%loaded' or lower(c2.name) like '%event' or lower(c2.name) like '%posted' then 0 else 1 end), c2.column_id) as src_date_col,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and c2.is_nullable = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') order by c2.column_id) as src_num_col,"
-            .. " (case when exists(select 1 from sys.partitions p where p.object_id = t.object_id and p.partition_number > 1) then 1 else 0 end) as src_partitioned,"
-            .. " NULL"
+            .. " cast(case when exists(select 1 from sys.partitions p where p.object_id = t.object_id and p.partition_number > 1) then 1 else 0 end as bit) as src_partitioned,"
+            .. " cast(NULL as varchar(8000)) as src_partitions"
             .. " from sys.tables t join sys.schemas s on s.schema_id = t.schema_id join sys.dm_db_partition_stats ps on ps.object_id = t.object_id and ps.index_id in (0, 1) where (<PREDICATE>) group by s.name, t.name, t.object_id",
         pair = "(s.name = '%s' and t.name = '%s')",
     },
