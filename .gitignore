@@ -1,0 +1,3 @@
+HANDOFF_*.md
+__pycache__/
+*.pyc
