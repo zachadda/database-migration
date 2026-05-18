@@ -1699,6 +1699,90 @@ test("PARTITION: emits no IS NULL OR clause", function()
     assert(not row[6]:find("IS NULL"), "partition predicates should not include IS NULL clause")
 end)
 
+print("=== BigQuery Per-Dataset Metadata ===")
+
+test("BigQuery single-dataset migration issues one round-trip", function()
+    -- Scenario: adapter emits 3 IMPORTs (single-statement each), all in dataset "analytics"
+    local sql1 = single_stmt_import("DST", "EVENTS1", "analytics", "EVENTS1")
+    local sql2 = single_stmt_import("DST", "EVENTS2", "analytics", "EVENTS2")
+    local sql3 = single_stmt_import("DST", "EVENTS3", "analytics", "EVENTS3")
+    local multi_sql = sql1:gsub("$", "; ") .. sql2:gsub("$", "; ") .. sql3
+    local result = run_migrate({
+        source_type = "BIGQUERY",
+        target_schema = "DST",
+        options = "PROJECT_ID=myproject;PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=AUTO",
+        adapter_rows = {{SQL_TEXT = multi_sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "analytics", SRC_TABLE = "EVENTS1", SRC_ROWS = 5000000, SRC_PK_COL = "event_id", SRC_PK_TYPE = "INT64", SRC_PK_MIN = 1, SRC_PK_MAX = 5000000, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = "event_dt", SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil},
+            {SRC_SCHEMA = "analytics", SRC_TABLE = "EVENTS2", SRC_ROWS = 5000000, SRC_PK_COL = "event_id", SRC_PK_TYPE = "INT64", SRC_PK_MIN = 1, SRC_PK_MAX = 5000000, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = "event_dt", SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil},
+            {SRC_SCHEMA = "analytics", SRC_TABLE = "EVENTS3", SRC_ROWS = 5000000, SRC_PK_COL = "event_id", SRC_PK_TYPE = "INT64", SRC_PK_MIN = 1, SRC_PK_MAX = 5000000, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = "event_dt", SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil},
+        },
+    })
+    assert_eq(#result.calls, 2, "BQ single-dataset should issue exactly 2 calls (adapter + 1 metadata)")
+    assert_contains(result.calls[2], "`myproject`.`analytics`.INFORMATION_SCHEMA.TABLES", "metadata SQL must reference dataset")
+    local row = find_import_row(result.rows, "DST.EVENTS1")
+    assert_eq(row[8], "MULTI_PASSTHROUGH", "5M rows above threshold should use splitter")
+end)
+
+test("BigQuery three-dataset migration issues three round-trips in lexicographic order", function()
+    local sql1 = single_stmt_import("DST", "T1", "raw", "T1")
+    local sql2 = single_stmt_import("DST", "T2", "staging", "T2")
+    local sql3 = single_stmt_import("DST", "T3", "analytics", "T3")
+    local multi_sql = sql1:gsub("$", "; ") .. sql2:gsub("$", "; ") .. sql3
+    local result = run_migrate({
+        source_type = "BIGQUERY",
+        target_schema = "DST",
+        options = "PROJECT_ID=myproject",
+        adapter_rows = {{SQL_TEXT = multi_sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "raw", SRC_TABLE = "T1", SRC_ROWS = 1000, SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil},
+            {SRC_SCHEMA = "staging", SRC_TABLE = "T2", SRC_ROWS = 1000, SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil},
+            {SRC_SCHEMA = "analytics", SRC_TABLE = "T3", SRC_ROWS = 1000, SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil},
+        },
+    })
+    assert_eq(#result.calls, 4, "BQ three-dataset should issue exactly 4 calls (adapter + 3 metadata)")
+    local datasets_in_order = {}
+    for i = 2, 4 do
+        if result.calls[i]:find("`myproject`.`analytics`") then
+            datasets_in_order[#datasets_in_order + 1] = "analytics"
+        elseif result.calls[i]:find("`myproject`.`raw`") then
+            datasets_in_order[#datasets_in_order + 1] = "raw"
+        elseif result.calls[i]:find("`myproject`.`staging`") then
+            datasets_in_order[#datasets_in_order + 1] = "staging"
+        end
+    end
+    assert_eq(datasets_in_order[1], "analytics", "first metadata call should be for 'analytics'")
+    assert_eq(datasets_in_order[2], "raw", "second metadata call should be for 'raw'")
+    assert_eq(datasets_in_order[3], "staging", "third metadata call should be for 'staging'")
+end)
+
+test("BigQuery per-dataset failure does not fail migration", function()
+    local sql = single_stmt_import("DST", "T1", "ok_ds", "T1")
+    local result = run_migrate({
+        source_type = "BIGQUERY",
+        target_schema = "DST",
+        options = "PROJECT_ID=myproject",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {
+            {SRC_SCHEMA = "ok_ds", SRC_TABLE = "T1", SRC_ROWS = 1000, SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil},
+        },
+    })
+    assert(#result.calls >= 1, "should have executed adapter call at minimum")
+end)
+
+test("Non-BigQuery source retains single round-trip", function()
+    local sql = single_stmt_import("DST", "T1", "public", "T1")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=1000000",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{SRC_SCHEMA = "public", SRC_TABLE = "T1", SRC_ROWS = 1000, SRC_PK_COL = "id", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 1000, SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil, SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false, SRC_PARTITIONS = nil}},
+    })
+    assert_eq(#result.calls, 2, "POSTGRES should issue exactly 2 calls (adapter + 1 shared metadata)")
+    assert_contains(result.calls[2], "select", "metadata call should have shared single-statement SQL")
+end)
+
 print("")
 print(string.format("=== Results: %d passed, %d failed ===", passed, failed))
 

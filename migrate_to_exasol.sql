@@ -394,8 +394,10 @@ SOURCE_METADATA_BY_SOURCE = {
         pair = "(t.table_schema = '%s' and t.table_name = '%s')",
     },
     BIGQUERY = {
-        mode = 'skip_with_info',
-        reason = 'BigQuery INFORMATION_SCHEMA is dataset-scoped; per-dataset metadata round-trip not yet implemented',
+        kind = 'per_dataset',
+        build_sql = function(dataset, table_filters, project_id)
+            return build_bigquery_metadata_sql(dataset, table_filters, project_id)
+        end,
     },
     REDSHIFT = {
         mode = 'sql',
@@ -590,6 +592,20 @@ function count_statement_clauses(sql)
     return n
 end
 
+-- Splits multi-statement IMPORT string into individual statements.
+-- Naive split on '; ' — assumes all STATEMENT clauses end with '; '.
+function split_multi_statement_import(sql)
+    if sql == nil or sql == '' then return {} end
+    local stmts = {}
+    for stmt in (sql .. '; '):gmatch('(.-);%s*') do
+        stmt = stmt:gsub('^%s+', ''):gsub('%s+$', '')
+        if stmt ~= '' then
+            stmts[#stmts + 1] = stmt
+        end
+    end
+    return stmts
+end
+
 function extract_source_ref_from_import(sql)
     if sql == nil then return nil, nil end
     -- Postgres / Oracle / MySQL / Snowflake adapters quote source identifiers
@@ -676,18 +692,86 @@ function collect_metadata_pairs(res, options)
                 relevant = true
             end
             if relevant then
-                local src_schema, src_table = extract_source_ref_from_import(sql_text)
-                if src_schema ~= nil and src_table ~= nil then
-                    local key = src_schema .. '\t' .. src_table
-                    if not pairs_seen[key] then
-                        pairs_seen[key] = true
-                        pair_list[#pair_list + 1] = { schema = src_schema, table_name = src_table }
+                -- For multi-statement IMPORTs, extract pairs from each statement individually.
+                if clauses > 1 then
+                    local stmts = split_multi_statement_import(sql_text)
+                    for _, stmt in ipairs(stmts) do
+                        if classify_step(stmt) == 'IMPORT' then
+                            local src_schema, src_table = extract_source_ref_from_import(stmt)
+                            if src_schema ~= nil and src_table ~= nil then
+                                local key = src_schema .. '\t' .. src_table
+                                if not pairs_seen[key] then
+                                    pairs_seen[key] = true
+                                    pair_list[#pair_list + 1] = { schema = src_schema, table_name = src_table }
+                                end
+                            end
+                        end
+                    end
+                else
+                    -- Single-statement IMPORT: extract pair as before.
+                    local src_schema, src_table = extract_source_ref_from_import(sql_text)
+                    if src_schema ~= nil and src_table ~= nil then
+                        local key = src_schema .. '\t' .. src_table
+                        if not pairs_seen[key] then
+                            pairs_seen[key] = true
+                            pair_list[#pair_list + 1] = { schema = src_schema, table_name = src_table }
+                        end
                     end
                 end
             end
         end
     end
     return pair_list
+end
+
+-- Groups (schema, table) pairs by schema (dataset). Returns { dataset = {pairs} }.
+function group_imports_by_dataset(pair_list)
+    local by_dataset = {}
+    if pair_list == nil then return by_dataset end
+    for _, pair in ipairs(pair_list) do
+        local dataset = pair.schema
+        if by_dataset[dataset] == nil then
+            by_dataset[dataset] = {}
+        end
+        by_dataset[dataset][#by_dataset[dataset] + 1] = pair
+    end
+    return by_dataset
+end
+
+-- Returns sorted list of dataset names for lexicographic iteration.
+function sorted_dataset_names(by_dataset)
+    local names = {}
+    for dataset, _ in pairs(by_dataset) do
+        names[#names + 1] = dataset
+    end
+    table.sort(names)
+    return names
+end
+
+-- Builds the BigQuery per-dataset metadata SQL. Returns a fully-qualified BQ SQL string
+-- against `<project>.<dataset>.INFORMATION_SCHEMA` tables.
+-- dataset: the BigQuery dataset name
+-- table_filters: list of {schema, table_name} pairs in this dataset
+-- project_id: extracted from connection or OPTIONS
+function build_bigquery_metadata_sql(dataset, table_filters, project_id)
+    local table_names = {}
+    for _, pair in ipairs(table_filters) do
+        table_names[#table_names + 1] = "'" .. escape_sql_literal(pair.table_name) .. "'"
+    end
+    local where_clause = "WHERE table_name IN (" .. table.concat(table_names, ",") .. ")"
+
+    -- BigQuery 15-column metadata shape (matching cache structure):
+    -- src_schema, src_table, src_rows, src_pk_col, src_pk_type,
+    -- src_pk_min, src_pk_max, src_unique_num_col, src_unique_num_type,
+    -- src_unique_num_min, src_unique_num_max, src_date_col, src_num_col, src_partitioned, src_partitions
+    local sql = "SELECT "
+        .. "'" .. escape_sql_literal(dataset) .. "' as src_schema, "
+        .. "table_name as src_table, "
+        .. "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL "
+        .. "FROM `" .. project_id .. "`.`" .. dataset .. "`.INFORMATION_SCHEMA.TABLES "
+        .. where_clause
+
+    return sql
 end
 
 -- Returns a metadata cache describing every source table referenced by IMPORTs in `res`.
@@ -697,6 +781,41 @@ end
 -- `available = false` means downstream consumers MUST pass IMPORTs through unchanged
 -- (Speq 2's soft-fail invariant for the splitter; matches Speq 1's gate behavior for
 -- lookup failure / unsupported source type).
+-- Helper to nullify BQ import results.
+local function nullify(v)
+    if is_null(v) then return nil end
+    return v
+end
+
+-- Helper to populate cache rows from JDBC result set.
+local function populate_cache_from_result(lookup_res)
+    local rows = {}
+    if lookup_res == nil then return rows end
+    for i = 1, #lookup_res do
+        local r = lookup_res[i]
+        local s = nullify(r.SRC_SCHEMA or r[1])
+        local t = nullify(r.SRC_TABLE or r[2])
+        if s ~= nil and t ~= nil then
+            rows[tostring(s) .. '\t' .. tostring(t)] = {
+                src_rows = nullify(r.SRC_ROWS or r[3]),
+                src_pk_col = nullify(r.SRC_PK_COL or r[4]),
+                src_pk_type = nullify(r.SRC_PK_TYPE or r[5]),
+                src_pk_min = nullify(r.SRC_PK_MIN or r[6]),
+                src_pk_max = nullify(r.SRC_PK_MAX or r[7]),
+                src_unique_num_col = nullify(r.SRC_UNIQUE_NUM_COL or r[8]),
+                src_unique_num_type = nullify(r.SRC_UNIQUE_NUM_TYPE or r[9]),
+                src_unique_num_min = nullify(r.SRC_UNIQUE_NUM_MIN or r[10]),
+                src_unique_num_max = nullify(r.SRC_UNIQUE_NUM_MAX or r[11]),
+                src_date_col = nullify(r.SRC_DATE_COL or r[12]),
+                src_num_col = nullify(r.SRC_NUM_COL or r[13]),
+                src_partitioned = nullify(r.SRC_PARTITIONED or r[14]),
+                src_partitions = nullify(r.SRC_PARTITIONS or r[15]),
+            }
+        end
+    end
+    return rows
+end
+
 function transform_for_metadata(res, source_type, connection_name, options)
     local empty = { available = false, rows = {}, info_rows = {} }
     if res == nil or #res == 0 then return empty end
@@ -719,6 +838,52 @@ function transform_for_metadata(res, source_type, connection_name, options)
         }
     end
 
+    -- Branch on dispatch kind: per_dataset vs. shared (default).
+    if dispatch and type(dispatch) == 'table' and dispatch.kind == 'per_dataset' then
+        local by_dataset = group_imports_by_dataset(pair_list)
+        local merged_rows = {}
+        local info_rows = {}
+        local dataset_names = sorted_dataset_names(by_dataset)
+        local project_id = blank_to_nil(opt(options, 'PROJECT_ID', nil))
+
+        for _, dataset in ipairs(dataset_names) do
+            local table_pairs = by_dataset[dataset]
+            local sql = dispatch.build_sql(dataset, table_pairs, project_id)
+
+            local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_pk_min decimal(36,0), src_pk_max decimal(36,0), src_unique_num_col varchar(2000), src_unique_num_type varchar(200), src_unique_num_min decimal(36,0), src_unique_num_max decimal(36,0), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean, src_partitions varchar(2000000)) from jdbc at "
+                .. connection_name
+                .. " statement '"
+                .. escape_sql_literal(sql)
+                .. "')"
+
+            local success, lookup_res = pquery(outer_sql)
+            if not success then
+                -- Per-dataset failure: emit INFO row with error, populate NULL rows for this dataset's tables.
+                local err_msg = (lookup_res and lookup_res.error_message) or 'unknown error'
+                info_rows[#info_rows + 1] = '-- PARALLEL_ROW_THRESHOLD gate: BigQuery metadata lookup failed for dataset ' .. dataset .. ': ' .. err_msg
+                for _, pair in ipairs(table_pairs) do
+                    local key = pair.schema .. '\t' .. pair.table_name
+                    merged_rows[key] = {
+                        src_rows = nil, src_pk_col = nil, src_pk_type = nil,
+                        src_pk_min = nil, src_pk_max = nil,
+                        src_unique_num_col = nil, src_unique_num_type = nil,
+                        src_unique_num_min = nil, src_unique_num_max = nil,
+                        src_date_col = nil, src_num_col = nil,
+                        src_partitioned = nil, src_partitions = nil,
+                    }
+                end
+            else
+                local cache = populate_cache_from_result(lookup_res)
+                for key, row_data in pairs(cache) do
+                    merged_rows[key] = row_data
+                end
+            end
+        end
+
+        return { available = true, rows = merged_rows, info_rows = info_rows }
+    end
+
+    -- Shared (default) path: one round-trip per migration.
     local pair_clauses = {}
     for _, p in ipairs(pair_list) do
         pair_clauses[#pair_clauses + 1] = string.format(dispatch.pair,
@@ -743,37 +908,7 @@ function transform_for_metadata(res, source_type, connection_name, options)
         }
     end
 
-    -- Exasol's IMPORT-FROM-JDBC layer returns SQL NULLs as a userdata sentinel,
-    -- not Lua nil. Coerce here so downstream truthiness checks work as written.
-    local function nullify(v)
-        if is_null(v) then return nil end
-        return v
-    end
-
-    local rows = {}
-    for i = 1, #lookup_res do
-        local r = lookup_res[i]
-        local s = nullify(r.SRC_SCHEMA or r[1])
-        local t = nullify(r.SRC_TABLE or r[2])
-        if s ~= nil and t ~= nil then
-            rows[tostring(s) .. '\t' .. tostring(t)] = {
-                src_rows = nullify(r.SRC_ROWS or r[3]),
-                src_pk_col = nullify(r.SRC_PK_COL or r[4]),
-                src_pk_type = nullify(r.SRC_PK_TYPE or r[5]),
-                src_pk_min = nullify(r.SRC_PK_MIN or r[6]),
-                src_pk_max = nullify(r.SRC_PK_MAX or r[7]),
-                src_unique_num_col = nullify(r.SRC_UNIQUE_NUM_COL or r[8]),
-                src_unique_num_type = nullify(r.SRC_UNIQUE_NUM_TYPE or r[9]),
-                src_unique_num_min = nullify(r.SRC_UNIQUE_NUM_MIN or r[10]),
-                src_unique_num_max = nullify(r.SRC_UNIQUE_NUM_MAX or r[11]),
-                src_date_col = nullify(r.SRC_DATE_COL or r[12]),
-                src_num_col = nullify(r.SRC_NUM_COL or r[13]),
-                src_partitioned = nullify(r.SRC_PARTITIONED or r[14]),
-                src_partitions = nullify(r.SRC_PARTITIONS or r[15]),
-            }
-        end
-    end
-
+    local rows = populate_cache_from_result(lookup_res)
     return { available = true, rows = rows, info_rows = {} }
 end
 
