@@ -1521,6 +1521,184 @@ test("UNIQUE_NUM: MOD fallback when src_unique_num_min/max NULL", function()
     assert_eq(row[8], "UNIQUE_NUM", "SPLIT_STRATEGY should be UNIQUE_NUM")
 end)
 
+print("=== PARTITION split v2 tests ===")
+
+test("PARTITION: AUTO picks PARTITION when src_partitions non-NULL even if pk_col present", function()
+    local sql = single_stmt_import("DST", "LOGS", "PUB", "LOGS")
+    local part_json = '[{"name":"LOGS_2026Q1","predicate":"tableoid::regclass = ' .. "'" .. 'LOGS_2026Q1' .. "'" .. '::regclass"},{"name":"LOGS_2026Q2","predicate":"tableoid::regclass = ' .. "'" .. 'LOGS_2026Q2' .. "'" .. '::regclass"},{"name":"LOGS_2026Q3","predicate":"tableoid::regclass = ' .. "'" .. 'LOGS_2026Q3' .. "'" .. '::regclass"},{"name":"LOGS_2026Q4","predicate":"tableoid::regclass = ' .. "'" .. 'LOGS_2026Q4' .. "'" .. '::regclass"}]'
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "LOGS", SRC_ROWS = 1000,
+            SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 1000,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = true,
+            SRC_PARTITIONS = part_json
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.LOGS")
+    assert_eq(count_clauses(row[6]), 4, "expected 4 PARTITION clauses")
+    assert_contains(row[6], "tableoid::regclass = ''LOGS_2026Q1''::regclass", "should contain partition 1 predicate")
+    assert_contains(row[6], "tableoid::regclass = ''LOGS_2026Q2''::regclass", "should contain partition 2 predicate")
+    assert_eq(row[8], "PARTITION", "SPLIT_STRATEGY should be PARTITION")
+    assert_eq(row[11], 4, "PARALLEL_EFFECTIVE should be 4")
+end)
+
+test("PARTITION: Fewer partitions than N collapses to N_effective = #partitions", function()
+    local sql = single_stmt_import("DST", "LOGS", "PUB", "LOGS")
+    local part_json = '[{"name":"LOGS_2026Q1","predicate":"tableoid::regclass = ' .. "'" .. 'LOGS_2026Q1' .. "'" .. '::regclass"},{"name":"LOGS_2026Q2","predicate":"tableoid::regclass = ' .. "'" .. 'LOGS_2026Q2' .. "'" .. '::regclass"}]'
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "LOGS", SRC_ROWS = 1000,
+            SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 1000,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = true,
+            SRC_PARTITIONS = part_json
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.LOGS")
+    assert_eq(count_clauses(row[6]), 2, "expected 2 PARTITION clauses (fewer than N=4)")
+    assert_eq(row[8], "PARTITION", "SPLIT_STRATEGY should be PARTITION")
+    assert_eq(row[11], 2, "PARALLEL_EFFECTIVE should be 2")
+end)
+
+test("PARTITION: More partitions than N chunks via OR-of-predicates", function()
+    local sql = single_stmt_import("DST", "EVENTS", "RAW", "EVENTS")
+    local part_json = '[{"name":"P0","predicate":"col = 0"},{"name":"P1","predicate":"col = 1"},{"name":"P2","predicate":"col = 2"},{"name":"P3","predicate":"col = 3"},{"name":"P4","predicate":"col = 4"},{"name":"P5","predicate":"col = 5"},{"name":"P6","predicate":"col = 6"},{"name":"P7","predicate":"col = 7"},{"name":"P8","predicate":"col = 8"},{"name":"P9","predicate":"col = 9"}]'
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "RAW", SRC_TABLE = "EVENTS", SRC_ROWS = 10000,
+            SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = true,
+            SRC_PARTITIONS = part_json
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.EVENTS")
+    assert_eq(count_clauses(row[6]), 4, "expected 4 STATEMENT clauses (chunked from 10 partitions)")
+    assert_eq(row[8], "PARTITION", "SPLIT_STRATEGY should be PARTITION")
+    assert_eq(row[11], 4, "PARALLEL_EFFECTIVE should be 4")
+end)
+
+test("PARTITION: AUTO falls through to PK_RANGE when src_partitions NULL", function()
+    local sql = single_stmt_import("DST", "ORDERS", "PUB", "ORDERS")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "ORDERS", SRC_ROWS = 1000,
+            SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 1000,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false,
+            SRC_PARTITIONS = nil
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.ORDERS")
+    assert_eq(row[8], "PK_RANGE", "SPLIT_STRATEGY should fall through to PK_RANGE")
+    assert_eq(row[9], "ID", "SPLIT_KEY should be ID")
+    -- verify no INFO row about PARTITION was emitted
+    local has_partition_info = false
+    for _, r in ipairs(result.rows) do
+        if r[1] == "INFO" and r[7] and r[7]:find("PARTITION") then
+            has_partition_info = true
+            break
+        end
+    end
+    assert(not has_partition_info, "should not emit INFO for silent fall-through")
+end)
+
+test("PARTITION: Forced PARALLEL_SPLIT=PARTITION soft-fails on non-partitioned source", function()
+    local sql = single_stmt_import("DST", "SIMPLE", "PUB", "SIMPLE")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=PARTITION",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "SIMPLE", SRC_ROWS = 1000,
+            SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 1000,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = false,
+            SRC_PARTITIONS = nil
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.SIMPLE")
+    assert(row, "IMPORT row must be present (soft-fail)")
+    assert_eq(count_clauses(row[6]), 1, "should pass through unchanged (single statement)")
+    assert_eq(row[8], "SINGLE", "SPLIT_STRATEGY should be SINGLE (soft-fail)")
+    -- verify INFO row was emitted
+    local has_info = false
+    for _, r in ipairs(result.rows) do
+        if r[1] == "INFO" and r[7] and r[7]:find("PARTITION") then
+            has_info = true
+            break
+        end
+    end
+    assert(has_info, "INFO audit row missing for soft-fail")
+end)
+
+test("PARTITION: Corrupt src_partitions JSON soft-fails to next step", function()
+    local sql = single_stmt_import("DST", "CORRUPTED", "PUB", "CORRUPTED")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "CORRUPTED", SRC_ROWS = 1000,
+            SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 1000,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = true,
+            SRC_PARTITIONS = 'not valid json'
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.CORRUPTED")
+    assert_eq(row[8], "PK_RANGE", "SPLIT_STRATEGY should fall through to PK_RANGE")
+    -- verify INFO row was emitted about parse failure
+    local has_info = false
+    for _, r in ipairs(result.rows) do
+        if r[1] == "INFO" and r[7] and r[7]:find("partition") then
+            has_info = true
+            break
+        end
+    end
+    assert(has_info, "INFO audit row missing for corrupt JSON parse")
+end)
+
+test("PARTITION: emits no IS NULL OR clause", function()
+    local sql = single_stmt_import("DST", "PARTITIONED_T", "PUB", "PARTITIONED_T")
+    local part_json = '[{"name":"P1","predicate":"col >= 1 AND col < 10"},{"name":"P2","predicate":"col >= 10 AND col < 20"}]'
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=2;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{
+            SRC_SCHEMA = "PUB", SRC_TABLE = "PARTITIONED_T", SRC_ROWS = 1000,
+            SRC_PK_COL = nil, SRC_PK_TYPE = nil, SRC_PK_MIN = nil, SRC_PK_MAX = nil,
+            SRC_UNIQUE_NUM_COL = nil, SRC_UNIQUE_NUM_TYPE = nil, SRC_UNIQUE_NUM_MIN = nil, SRC_UNIQUE_NUM_MAX = nil,
+            SRC_DATE_COL = nil, SRC_NUM_COL = nil, SRC_PARTITIONED = true,
+            SRC_PARTITIONS = part_json
+        }},
+    })
+    local row = find_import_row(result.rows, "DST.PARTITIONED_T")
+    assert_eq(count_clauses(row[6]), 2, "expected 2 PARTITION clauses")
+    assert(not row[6]:find("IS NULL"), "partition predicates should not include IS NULL clause")
+end)
+
 print("")
 print(string.format("=== Results: %d passed, %d failed ===", passed, failed))
 

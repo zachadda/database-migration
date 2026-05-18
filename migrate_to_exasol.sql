@@ -328,7 +328,7 @@ end
 SOURCE_METADATA_BY_SOURCE = {
     ORACLE = {
         mode = 'sql',
-        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from all_tables where (<PREDICATE>)",
+        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from all_tables where (<PREDICATE>)",
         pair = "(owner = '%s' and table_name = '%s')",
     },
     POSTGRES = {
@@ -342,8 +342,9 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " NULL, NULL,"
             .. " (select a.attname::text from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.atttypid in (1082, 1114, 1184) order by (case when a.attname ~* '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), a.attnum limit 1),"
             .. " (select a.attname::text from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.attnotnull and a.atttypid in (20, 21, 23, 700, 701, 1700) order by a.attnum limit 1),"
-            .. " (c.relkind = 'p')"
-            .. " from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p') and (<PREDICATE>)",
+            .. " (c.relkind = 'p'),"
+            .. " (case when (c.relkind = 'p') then '[' || string_agg('{\"name\":\"' || pc.relname || '\",\"predicate\":\"tableoid::regclass = ' || quote_literal(pc.relname::text) || '::regclass\"}', ',') || ']' else NULL end)"
+            .. " from pg_class c join pg_namespace n on n.oid = c.relnamespace left join pg_inherits inh on inh.inhparent = c.oid left join pg_class pc on pc.oid = inh.inhrelid where c.relkind in ('r','p') and (<PREDICATE>) group by c.oid, n.nspname, c.relname, c.relkind, c.reltuples",
         pair = "(n.nspname = '%s' and c.relname = '%s')",
     },
     MYSQL = {
@@ -357,7 +358,8 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " NULL, NULL,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('date','datetime','timestamp') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1),"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') order by ordinal_position limit 1),"
-            .. " (select count(*) > 0 from information_schema.partitions where table_schema = t.table_schema and table_name = t.table_name and partition_name is not null)"
+            .. " (select count(*) > 0 from information_schema.partitions where table_schema = t.table_schema and table_name = t.table_name and partition_name is not null),"
+            .. " NULL"
             .. " from information_schema.tables t where (<PREDICATE>)",
         pair = "(t.table_schema = '%s' and t.table_name = '%s')",
     },
@@ -372,7 +374,8 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " NULL, NULL,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and ty.name in ('date','datetime','datetime2','smalldatetime','datetimeoffset','time') order by (case when lower(c2.name) like '%date' or lower(c2.name) like '%dt' or lower(c2.name) like '%time' or lower(c2.name) like '%day' or lower(c2.name) like '%created' or lower(c2.name) like '%loaded' or lower(c2.name) like '%event' or lower(c2.name) like '%posted' then 0 else 1 end), c2.column_id) as src_date_col,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and c2.is_nullable = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') order by c2.column_id) as src_num_col,"
-            .. " (case when exists(select 1 from sys.partitions p where p.object_id = t.object_id and p.partition_number > 1) then 1 else 0 end) as src_partitioned"
+            .. " (case when exists(select 1 from sys.partitions p where p.object_id = t.object_id and p.partition_number > 1) then 1 else 0 end) as src_partitioned,"
+            .. " NULL"
             .. " from sys.tables t join sys.schemas s on s.schema_id = t.schema_id join sys.dm_db_partition_stats ps on ps.object_id = t.object_id and ps.index_id in (0, 1) where (<PREDICATE>) group by s.name, t.name, t.object_id",
         pair = "(s.name = '%s' and t.name = '%s')",
     },
@@ -385,7 +388,8 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " NULL, NULL, NULL, NULL,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('DATE','TIMESTAMP','TIMESTAMP_LTZ','TIMESTAMP_NTZ','TIMESTAMP_TZ','DATETIME','TIME') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1) as src_date_col,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('NUMBER','DECIMAL','FLOAT','REAL','DOUBLE','INTEGER','BIGINT','SMALLINT','TINYINT','BYTEINT') order by ordinal_position limit 1) as src_num_col,"
-            .. " FALSE as src_partitioned"
+            .. " FALSE as src_partitioned,"
+            .. " NULL"
             .. " from information_schema.tables t where (<PREDICATE>)",
         pair = "(t.table_schema = '%s' and t.table_name = '%s')",
     },
@@ -395,37 +399,37 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     REDSHIFT = {
         mode = 'sql',
-        template = [[select "schema", "table", tbl_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from svv_table_info where (<PREDICATE>)]],
+        template = [[select "schema", "table", tbl_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from svv_table_info where (<PREDICATE>)]],
         pair = [[("schema" = '%s' and "table" = '%s')]],
     },
     VERTICA = {
         mode = 'sql',
-        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from projection_storage where (<PREDICATE>)",
+        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from projection_storage where (<PREDICATE>)",
         pair = "(projection_schema = '%s' and anchor_table_name = '%s')",
     },
     DB2 = {
         mode = 'sql',
-        template = "select tabschema, tabname, card, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from syscat.tables where (<PREDICATE>)",
+        template = "select tabschema, tabname, card, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from syscat.tables where (<PREDICATE>)",
         pair = "(tabschema = '%s' and tabname = '%s')",
     },
     HANA = {
         mode = 'sql',
-        template = "select schema_name, table_name, record_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from sys.m_tables where (<PREDICATE>)",
+        template = "select schema_name, table_name, record_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from sys.m_tables where (<PREDICATE>)",
         pair = "(schema_name = '%s' and table_name = '%s')",
     },
     NETEZZA = {
         mode = 'sql',
-        template = [[select schema, tablename, reltuples, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from _v_table where (<PREDICATE>)]],
+        template = [[select schema, tablename, reltuples, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from _v_table where (<PREDICATE>)]],
         pair = [[(schema = '%s' and tablename = '%s')]],
     },
     TERADATA = {
         mode = 'sql',
-        template = "select databasename, tablename, currentpermspace, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from dbc.tablesizev where (<PREDICATE>)",
+        template = "select databasename, tablename, currentpermspace, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from dbc.tablesizev where (<PREDICATE>)",
         pair = "(databasename = '%s' and tablename = '%s')",
     },
     DATABRICKS = {
         mode = 'sql',
-        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from information_schema.tables where (<PREDICATE>)",
+        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from information_schema.tables where (<PREDICATE>)",
         pair = "(table_schema = '%s' and table_name = '%s')",
     },
 }
@@ -447,6 +451,7 @@ DIALECT_BY_SOURCE = {
         rowid_supported = true,
         rowid_expr = 'ctid',
         rowid_where = function(n, k) return 'MOD(ABS(HASHTEXT(ctid::text)), ' .. n .. ') = ' .. k end,
+        partition_predicate = function(p) return p.predicate end,
     },
     SQLSERVER = {
         -- T-SQL has no MOD() function; the modulo operator is `%`.
@@ -459,6 +464,7 @@ DIALECT_BY_SOURCE = {
         rowid_supported = true,
         rowid_expr = '%%physloc%%',
         rowid_where = function(n, k) return '(ABS(CHECKSUM(%%physloc%%)) % ' .. n .. ') = ' .. k end,
+        partition_predicate = function(p) return p.predicate end,
     },
     MYSQL = {
         -- MySQL's default sql_mode rejects double-quoted identifiers (treats
@@ -491,6 +497,7 @@ DIALECT_BY_SOURCE = {
         rowid_supported = true,
         rowid_expr = 'ROWID',
         rowid_where = function(n, k) return 'MOD(ORA_HASH(ROWID), ' .. n .. ') = ' .. k end,
+        partition_predicate = function(p) return p.predicate end,
     },
     DB2 = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
@@ -511,6 +518,7 @@ DIALECT_BY_SOURCE = {
         year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
         hash_where = function(col, n, k) return 'MOD(HASH("' .. col .. '"), ' .. n .. ') = ' .. k end,
         rowid_supported = false,
+        partition_predicate = function(p) return p.predicate end,
     },
     HANA = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
@@ -539,6 +547,7 @@ DIALECT_BY_SOURCE = {
         year_month_fn = function(col) return '(YEAR(`' .. col .. '`) * 12 + MONTH(`' .. col .. '`))' end,
         hash_where = function(col, n, k) return 'PMOD(HASH(`' .. col .. '`), ' .. n .. ') = ' .. k end,
         rowid_supported = false,
+        partition_predicate = function(p) return p.predicate end,
     },
     BIGQUERY = {
         pk_where = function(col, n, k) return 'MOD(`' .. col .. '`, ' .. n .. ') = ' .. k end,
@@ -548,6 +557,7 @@ DIALECT_BY_SOURCE = {
         year_month_fn = function(col) return '(EXTRACT(YEAR FROM `' .. col .. '`) * 12 + EXTRACT(MONTH FROM `' .. col .. '`))' end,
         hash_where = function(col, n, k) return 'MOD(ABS(FARM_FINGERPRINT(CAST(`' .. col .. '` AS STRING))), ' .. n .. ') = ' .. k end,
         rowid_supported = false,
+        partition_predicate = function(p) return p.predicate end,
     },
     NETEZZA = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
@@ -717,7 +727,7 @@ function transform_for_metadata(res, source_type, connection_name, options)
     local predicate = table.concat(pair_clauses, ' or ')
     local metadata_sql = (dispatch.template:gsub('<PREDICATE>', function() return predicate end))
 
-    local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_pk_min decimal(36,0), src_pk_max decimal(36,0), src_unique_num_col varchar(2000), src_unique_num_type varchar(200), src_unique_num_min decimal(36,0), src_unique_num_max decimal(36,0), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean) from jdbc at "
+    local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_pk_min decimal(36,0), src_pk_max decimal(36,0), src_unique_num_col varchar(2000), src_unique_num_type varchar(200), src_unique_num_min decimal(36,0), src_unique_num_max decimal(36,0), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean, src_partitions varchar(2000000)) from jdbc at "
         .. connection_name
         .. " statement '"
         .. escape_sql_literal(metadata_sql)
@@ -759,6 +769,7 @@ function transform_for_metadata(res, source_type, connection_name, options)
                 src_date_col = nullify(r.SRC_DATE_COL or r[12]),
                 src_num_col = nullify(r.SRC_NUM_COL or r[13]),
                 src_partitioned = nullify(r.SRC_PARTITIONED or r[14]),
+                src_partitions = nullify(r.SRC_PARTITIONS or r[15]),
             }
         end
     end
@@ -950,17 +961,112 @@ function is_numeric_pk_type(type_str)
     return false
 end
 
+function parse_partitions(json_str)
+    if json_str == nil then return nil end
+
+    -- Minimal JSON array parser for partition objects
+    -- Expected format: [{"name":"<name>","predicate":"<predicate>"}, ...]
+    local result = {}
+    local i = 1
+    local n = #json_str
+
+    -- Skip whitespace and opening bracket
+    while i <= n and json_str:sub(i, i):match('[%s%[]') do i = i + 1 end
+    if i > n then return nil end
+
+    -- Parse objects until closing bracket
+    while i <= n do
+        -- Skip whitespace
+        while i <= n and json_str:sub(i, i):match('%s') do i = i + 1 end
+        if i > n then break end
+
+        local ch = json_str:sub(i, i)
+        if ch == ']' then break end
+        if ch ~= '{' then return nil end
+
+        i = i + 1
+        local obj = {}
+
+        -- Parse object fields
+        local field_count = 0
+        while i <= n do
+            -- Skip whitespace
+            while i <= n and json_str:sub(i, i):match('%s') do i = i + 1 end
+            if i > n then return nil end
+
+            ch = json_str:sub(i, i)
+            if ch == '}' then i = i + 1; break end
+            if ch == ',' then i = i + 1; field_count = 0 end
+            if field_count > 0 then return nil end
+
+            -- Parse field name
+            if json_str:sub(i, i) ~= '"' then return nil end
+            i = i + 1
+            local fname_start = i
+            while i <= n and json_str:sub(i, i) ~= '"' do
+                if json_str:sub(i, i) == '\\' then i = i + 2 else i = i + 1 end
+            end
+            if i > n then return nil end
+            local fname = json_str:sub(fname_start, i - 1)
+            i = i + 1
+
+            -- Skip whitespace and colon
+            while i <= n and json_str:sub(i, i):match('[%s:]') do i = i + 1 end
+            if i > n then return nil end
+
+            -- Parse field value (string only)
+            if json_str:sub(i, i) ~= '"' then return nil end
+            i = i + 1
+            local fval_start = i
+            while i <= n and json_str:sub(i, i) ~= '"' do
+                if json_str:sub(i, i) == '\\' then i = i + 2 else i = i + 1 end
+            end
+            if i > n then return nil end
+            local fval = json_str:sub(fval_start, i - 1)
+            i = i + 1
+
+            obj[fname] = fval
+            field_count = field_count + 1
+        end
+
+        if obj.name and obj.predicate then
+            result[#result + 1] = obj
+        end
+
+        -- Skip whitespace and comma
+        while i <= n and json_str:sub(i, i):match('[%s,]') do i = i + 1 end
+    end
+
+    if #result == 0 then return nil end
+    return result
+end
+
 function pick_split_strategy(meta, options, dialect, source_type)
     local directive = parse_split_directive(options)
     if directive.mode == 'OFF' then return nil, nil end
 
     if directive.mode == 'AUTO' then
         if meta == nil then return nil, 'metadata cache empty' end
+        -- PARTITION is first step in AUTO hierarchy
+        local partition_parse_failed = false
+        if meta.src_partitions and dialect and dialect.partition_predicate then
+            local partitions = parse_partitions(meta.src_partitions)
+            if partitions then
+                return { strategy = 'PARTITION', partitions = partitions }
+            else
+                -- JSON parse failed; continue to next strategy and emit INFO later
+                partition_parse_failed = true
+            end
+        end
         if meta.src_pk_col and is_numeric_pk_type(meta.src_pk_type) then
             local decision = { strategy = 'PK_RANGE', key = meta.src_pk_col }
             if meta.src_pk_min ~= nil and meta.src_pk_max ~= nil then
                 decision.lo = meta.src_pk_min
                 decision.hi = meta.src_pk_max
+            end
+            -- If PARTITION parse failed, attach INFO message to this decision
+            if partition_parse_failed then
+                decision.soft_fail_info = 'partition cache string was unparseable'
             end
             return decision
         end
@@ -1028,7 +1134,13 @@ function pick_split_strategy(meta, options, dialect, source_type)
     end
 
     if directive.mode == 'PARTITION' then
-        return nil, 'PARALLEL_SPLIT=PARTITION not supported in v1'
+        if meta == nil then return nil, 'metadata cache empty' end
+        local partitions = meta.src_partitions and parse_partitions(meta.src_partitions)
+        if partitions then
+            return { strategy = 'PARTITION', partitions = partitions }
+        end
+        -- Forced PARTITION on non-partitioned source: soft-fail to SINGLE with INFO
+        return { strategy = 'SINGLE', soft_fail = 'PARTITION requested but source not partitioned' }
     end
 
     return nil, 'unsupported PARALLEL_SPLIT mode ' .. tostring(directive.mode)
@@ -1098,6 +1210,23 @@ end
 
 function build_where_for_split(decision, dialect, n, k)
     if decision == nil then return nil end
+    if decision.strategy == 'PARTITION' then
+        if decision.partitions == nil or #decision.partitions == 0 then return nil end
+        -- Chunking: group partitions into n chunks, each chunk k covers slice*k to slice*(k+1)
+        local num_partitions = #decision.partitions
+        local num_chunks = math.min(n, num_partitions)
+        if k >= num_chunks then return nil end
+        -- If fewer partitions than n, emit exactly one partition per STATEMENT
+        local slice = math.ceil(num_partitions / num_chunks)
+        local start_idx = k * slice + 1
+        local end_idx = math.min((k + 1) * slice, num_partitions)
+        -- OR together the partition predicates in this chunk
+        local predicates = {}
+        for i = start_idx, end_idx do
+            predicates[#predicates + 1] = '(' .. decision.partitions[i].predicate .. ')'
+        end
+        return table.concat(predicates, ' OR ')
+    end
     if decision.strategy == 'PK_RANGE' or decision.strategy == 'UNIQUE_NUM' then
         -- BETWEEN path: when min/max are available and dialect supports pk_between.
         if decision.lo ~= nil and decision.hi ~= nil and dialect and dialect.pk_between then
@@ -1268,7 +1397,17 @@ function transform_for_split(res, options, cache, source_type, decisions)
                     local n = resolved.effective
                     if n >= 2 then
                         local decision, reason = pick_split_strategy(meta, options, dialect, source_type)
-                        if decision ~= nil then
+                        -- Check for soft-fail case (e.g., forced PARTITION on non-partitioned source)
+                        if decision and decision.soft_fail then
+                            info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ' -> SINGLE (' .. decision.soft_fail .. ')'
+                            decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
+                        elseif decision and decision.soft_fail_info then
+                            -- Emit INFO about the soft-fail but use this decision for splitting
+                            info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ': ' .. decision.soft_fail_info
+                            -- Fall through to normal split logic below
+                        end
+                        if decision ~= nil and not decision.soft_fail then
+                            -- Normal split case
                             local where_per_k = {}
                             for k = 0, n - 1 do
                                 local w = build_where_for_split(decision, dialect, n, k)
@@ -1290,6 +1429,7 @@ function transform_for_split(res, options, cache, source_type, decisions)
                                 decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
                             end
                         else
+                            -- decision is nil, use reason for fallthrough
                             if reason ~= nil then
                                 info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ' -> SINGLE (' .. reason .. ')'
                             end
