@@ -328,7 +328,7 @@ end
 SOURCE_METADATA_BY_SOURCE = {
     ORACLE = {
         mode = 'sql',
-        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL from all_tables where (<PREDICATE>)",
+        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL from all_tables where (<PREDICATE>)",
         pair = "(owner = '%s' and table_name = '%s')",
     },
     POSTGRES = {
@@ -336,6 +336,7 @@ SOURCE_METADATA_BY_SOURCE = {
         template = "select n.nspname, c.relname, c.reltuples::bigint,"
             .. " (select a.attname::text from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = con.conkey[1] where con.conrelid = c.oid and con.contype = 'p' and array_length(con.conkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) limit 1),"
             .. " (select format_type(a.atttypid, a.atttypmod) from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = con.conkey[1] where con.conrelid = c.oid and con.contype = 'p' and array_length(con.conkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) limit 1),"
+            .. " NULL, NULL,"
             .. " (select a.attname::text from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.atttypid in (1082, 1114, 1184) order by (case when a.attname ~* '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), a.attnum limit 1),"
             .. " (select a.attname::text from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.attnotnull and a.atttypid in (20, 21, 23, 700, 701, 1700) order by a.attnum limit 1),"
             .. " (c.relkind = 'p')"
@@ -347,6 +348,7 @@ SOURCE_METADATA_BY_SOURCE = {
         template = "select t.table_schema, t.table_name, t.table_rows,"
             .. " (select kcu.column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name join information_schema.columns col on col.table_schema = kcu.table_schema and col.table_name = kcu.table_name and col.column_name = kcu.column_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name and col.data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') and kcu.constraint_name in (select constraint_name from information_schema.key_column_usage where table_schema = t.table_schema and table_name = t.table_name group by constraint_name having count(*) = 1) limit 1),"
             .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select kcu.column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name limit 1) limit 1),"
+            .. " NULL, NULL,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('date','datetime','timestamp') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1),"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') order by ordinal_position limit 1),"
             .. " (select count(*) > 0 from information_schema.partitions where table_schema = t.table_schema and table_name = t.table_name and partition_name is not null)"
@@ -358,6 +360,7 @@ SOURCE_METADATA_BY_SOURCE = {
         template = "select s.name as src_schema, t.name as src_table, sum(ps.row_count) as src_rows,"
             .. " (select top 1 c2.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_primary_key = 1 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_pk_col,"
             .. " (select top 1 ty.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_primary_key = 1 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_pk_type,"
+            .. " NULL, NULL,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and ty.name in ('date','datetime','datetime2','smalldatetime','datetimeoffset','time') order by (case when lower(c2.name) like '%date' or lower(c2.name) like '%dt' or lower(c2.name) like '%time' or lower(c2.name) like '%day' or lower(c2.name) like '%created' or lower(c2.name) like '%loaded' or lower(c2.name) like '%event' or lower(c2.name) like '%posted' then 0 else 1 end), c2.column_id) as src_date_col,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and c2.is_nullable = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') order by c2.column_id) as src_num_col,"
             .. " (case when exists(select 1 from sys.partitions p where p.object_id = t.object_id and p.partition_number > 1) then 1 else 0 end) as src_partitioned"
@@ -369,6 +372,7 @@ SOURCE_METADATA_BY_SOURCE = {
         template = "select t.table_schema, t.table_name, t.row_count,"
             .. " (select kcu.column_name from information_schema.table_constraints tc join information_schema.key_column_usage kcu on kcu.constraint_name = tc.constraint_name and kcu.table_schema = tc.table_schema and kcu.table_name = tc.table_name join information_schema.columns col on col.table_schema = kcu.table_schema and col.table_name = kcu.table_name and col.column_name = kcu.column_name where tc.constraint_type = 'PRIMARY KEY' and tc.table_schema = t.table_schema and tc.table_name = t.table_name and col.data_type in ('NUMBER','DECIMAL','FLOAT','REAL','DOUBLE','INTEGER','BIGINT','SMALLINT','TINYINT','BYTEINT') and (select count(*) from information_schema.key_column_usage k2 where k2.constraint_name = tc.constraint_name and k2.table_schema = tc.table_schema and k2.table_name = tc.table_name) = 1 limit 1) as src_pk_col,"
             .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select kcu.column_name from information_schema.table_constraints tc join information_schema.key_column_usage kcu on kcu.constraint_name = tc.constraint_name and kcu.table_schema = tc.table_schema and kcu.table_name = tc.table_name where tc.constraint_type = 'PRIMARY KEY' and tc.table_schema = t.table_schema and tc.table_name = t.table_name limit 1) limit 1) as src_pk_type,"
+            .. " NULL, NULL,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('DATE','TIMESTAMP','TIMESTAMP_LTZ','TIMESTAMP_NTZ','TIMESTAMP_TZ','DATETIME','TIME') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1) as src_date_col,"
             .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('NUMBER','DECIMAL','FLOAT','REAL','DOUBLE','INTEGER','BIGINT','SMALLINT','TINYINT','BYTEINT') order by ordinal_position limit 1) as src_num_col,"
             .. " FALSE as src_partitioned"
@@ -381,37 +385,37 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     REDSHIFT = {
         mode = 'sql',
-        template = [[select "schema", "table", tbl_rows, NULL, NULL, NULL, NULL, NULL from svv_table_info where (<PREDICATE>)]],
+        template = [[select "schema", "table", tbl_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL from svv_table_info where (<PREDICATE>)]],
         pair = [[("schema" = '%s' and "table" = '%s')]],
     },
     VERTICA = {
         mode = 'sql',
-        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL from projection_storage where (<PREDICATE>)",
+        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL from projection_storage where (<PREDICATE>)",
         pair = "(projection_schema = '%s' and anchor_table_name = '%s')",
     },
     DB2 = {
         mode = 'sql',
-        template = "select tabschema, tabname, card, NULL, NULL, NULL, NULL, NULL from syscat.tables where (<PREDICATE>)",
+        template = "select tabschema, tabname, card, NULL, NULL, NULL, NULL, NULL, NULL, NULL from syscat.tables where (<PREDICATE>)",
         pair = "(tabschema = '%s' and tabname = '%s')",
     },
     HANA = {
         mode = 'sql',
-        template = "select schema_name, table_name, record_count, NULL, NULL, NULL, NULL, NULL from sys.m_tables where (<PREDICATE>)",
+        template = "select schema_name, table_name, record_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL from sys.m_tables where (<PREDICATE>)",
         pair = "(schema_name = '%s' and table_name = '%s')",
     },
     NETEZZA = {
         mode = 'sql',
-        template = [[select schema, tablename, reltuples, NULL, NULL, NULL, NULL, NULL from _v_table where (<PREDICATE>)]],
+        template = [[select schema, tablename, reltuples, NULL, NULL, NULL, NULL, NULL, NULL, NULL from _v_table where (<PREDICATE>)]],
         pair = [[(schema = '%s' and tablename = '%s')]],
     },
     TERADATA = {
         mode = 'sql',
-        template = "select databasename, tablename, currentpermspace, NULL, NULL, NULL, NULL, NULL from dbc.tablesizev where (<PREDICATE>)",
+        template = "select databasename, tablename, currentpermspace, NULL, NULL, NULL, NULL, NULL, NULL, NULL from dbc.tablesizev where (<PREDICATE>)",
         pair = "(databasename = '%s' and tablename = '%s')",
     },
     DATABRICKS = {
         mode = 'sql',
-        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL from information_schema.tables where (<PREDICATE>)",
+        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL from information_schema.tables where (<PREDICATE>)",
         pair = "(table_schema = '%s' and table_name = '%s')",
     },
 }
@@ -425,6 +429,7 @@ SOURCE_METADATA_BY_SOURCE.AZURE_SQL = SOURCE_METADATA_BY_SOURCE.SQLSERVER
 DIALECT_BY_SOURCE = {
     POSTGRES = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'EXTRACT(MONTH FROM "' .. col .. '")' end,
         day_fn = function(col) return 'EXTRACT(DAY FROM "' .. col .. '")' end,
         year_month_fn = function(col) return '(EXTRACT(YEAR FROM "' .. col .. '") * 12 + EXTRACT(MONTH FROM "' .. col .. '"))' end,
@@ -436,6 +441,7 @@ DIALECT_BY_SOURCE = {
     SQLSERVER = {
         -- T-SQL has no MOD() function; the modulo operator is `%`.
         pk_where = function(col, n, k) return '("' .. col .. '" % ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '[' .. col .. '] BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'MONTH("' .. col .. '")' end,
         day_fn = function(col) return 'DAY("' .. col .. '")' end,
         year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
@@ -449,6 +455,7 @@ DIALECT_BY_SOURCE = {
         -- them as string literals). Adapters consistently emit backticks for
         -- source-side identifiers, so the WHERE we AND in must match.
         pk_where = function(col, n, k) return '(`' .. col .. '` MOD ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '`' .. col .. '` BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'MONTH(`' .. col .. '`)' end,
         day_fn = function(col) return 'DAY(`' .. col .. '`)' end,
         year_month_fn = function(col) return '(YEAR(`' .. col .. '`) * 12 + MONTH(`' .. col .. '`))' end,
@@ -457,6 +464,7 @@ DIALECT_BY_SOURCE = {
     },
     SNOWFLAKE = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'MONTH("' .. col .. '")' end,
         day_fn = function(col) return 'DAY("' .. col .. '")' end,
         year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
@@ -465,6 +473,7 @@ DIALECT_BY_SOURCE = {
     },
     ORACLE = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'EXTRACT(MONTH FROM "' .. col .. '")' end,
         day_fn = function(col) return 'EXTRACT(DAY FROM "' .. col .. '")' end,
         year_month_fn = function(col) return '(EXTRACT(YEAR FROM "' .. col .. '") * 12 + EXTRACT(MONTH FROM "' .. col .. '"))' end,
@@ -475,6 +484,7 @@ DIALECT_BY_SOURCE = {
     },
     DB2 = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'MONTH("' .. col .. '")' end,
         day_fn = function(col) return 'DAY("' .. col .. '")' end,
         year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
@@ -485,6 +495,7 @@ DIALECT_BY_SOURCE = {
     },
     VERTICA = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'MONTH("' .. col .. '")' end,
         day_fn = function(col) return 'DAY("' .. col .. '")' end,
         year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
@@ -493,6 +504,7 @@ DIALECT_BY_SOURCE = {
     },
     HANA = {
         pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'MONTH("' .. col .. '")' end,
         day_fn = function(col) return 'DAYOFMONTH("' .. col .. '")' end,
         year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
@@ -502,6 +514,7 @@ DIALECT_BY_SOURCE = {
     REDSHIFT = {
         -- Redshift inherits Postgres modulo semantics.
         pk_where = function(col, n, k) return '("' .. col .. '" % ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'EXTRACT(MONTH FROM "' .. col .. '")' end,
         day_fn = function(col) return 'EXTRACT(DAY FROM "' .. col .. '")' end,
         year_month_fn = function(col) return '(EXTRACT(YEAR FROM "' .. col .. '") * 12 + EXTRACT(MONTH FROM "' .. col .. '"))' end,
@@ -510,10 +523,38 @@ DIALECT_BY_SOURCE = {
     },
     DATABRICKS = {
         pk_where = function(col, n, k) return 'PMOD(`' .. col .. '`, ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '`' .. col .. '` BETWEEN ' .. lo .. ' AND ' .. hi end,
         month_fn = function(col) return 'MONTH(`' .. col .. '`)' end,
         day_fn = function(col) return 'DAY(`' .. col .. '`)' end,
         year_month_fn = function(col) return '(YEAR(`' .. col .. '`) * 12 + MONTH(`' .. col .. '`))' end,
         hash_where = function(col, n, k) return 'PMOD(HASH(`' .. col .. '`), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+    BIGQUERY = {
+        pk_where = function(col, n, k) return 'MOD(`' .. col .. '`, ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '`' .. col .. '` BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'EXTRACT(MONTH FROM `' .. col .. '`)' end,
+        day_fn = function(col) return 'EXTRACT(DAY FROM `' .. col .. '`)' end,
+        year_month_fn = function(col) return '(EXTRACT(YEAR FROM `' .. col .. '`) * 12 + EXTRACT(MONTH FROM `' .. col .. '`))' end,
+        hash_where = function(col, n, k) return 'MOD(ABS(FARM_FINGERPRINT(CAST(`' .. col .. '` AS STRING))), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+    NETEZZA = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH("' .. col .. '")' end,
+        day_fn = function(col) return 'DAY("' .. col .. '")' end,
+        year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(HASH("' .. col .. '"), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+    TERADATA = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'EXTRACT(MONTH FROM "' .. col .. '")' end,
+        day_fn = function(col) return 'EXTRACT(DAY FROM "' .. col .. '")' end,
+        year_month_fn = function(col) return '(EXTRACT(YEAR FROM "' .. col .. '") * 12 + EXTRACT(MONTH FROM "' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(HASHROW("' .. col .. '"), ' .. n .. ') = ' .. k end,
         rowid_supported = false,
     },
 }
@@ -600,8 +641,9 @@ function collect_metadata_pairs(res, options)
 
     local threshold = parse_threshold(options)
     local splitter_active = splitter_potentially_active(options)
+    local ps_explicit = blank_to_nil(opt(options, 'PARALLEL_STATEMENTS', nil)) ~= nil
 
-    if threshold <= 0 and not splitter_active then return pair_list end
+    if threshold <= 0 and not (splitter_active and ps_explicit) then return pair_list end
 
     for i = 1, #res do
         local sql_text = first_sql_text(res[i])
@@ -610,7 +652,7 @@ function collect_metadata_pairs(res, options)
             local relevant = false
             if clauses > 1 and threshold > 0 then
                 relevant = true
-            elseif clauses == 1 and splitter_active and threshold > 0 then
+            elseif clauses == 1 and splitter_active then
                 relevant = true
             end
             if relevant then
@@ -665,7 +707,7 @@ function transform_for_metadata(res, source_type, connection_name, options)
     local predicate = table.concat(pair_clauses, ' or ')
     local metadata_sql = (dispatch.template:gsub('<PREDICATE>', function() return predicate end))
 
-    local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean) from jdbc at "
+    local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_pk_min decimal(36,0), src_pk_max decimal(36,0), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean) from jdbc at "
         .. connection_name
         .. " statement '"
         .. escape_sql_literal(metadata_sql)
@@ -698,9 +740,11 @@ function transform_for_metadata(res, source_type, connection_name, options)
                 src_rows = nullify(r.SRC_ROWS or r[3]),
                 src_pk_col = nullify(r.SRC_PK_COL or r[4]),
                 src_pk_type = nullify(r.SRC_PK_TYPE or r[5]),
-                src_date_col = nullify(r.SRC_DATE_COL or r[6]),
-                src_num_col = nullify(r.SRC_NUM_COL or r[7]),
-                src_partitioned = nullify(r.SRC_PARTITIONED or r[8]),
+                src_pk_min = nullify(r.SRC_PK_MIN or r[6]),
+                src_pk_max = nullify(r.SRC_PK_MAX or r[7]),
+                src_date_col = nullify(r.SRC_DATE_COL or r[8]),
+                src_num_col = nullify(r.SRC_NUM_COL or r[9]),
+                src_partitioned = nullify(r.SRC_PARTITIONED or r[10]),
             }
         end
     end
@@ -895,7 +939,12 @@ function pick_split_strategy(meta, options, dialect, source_type)
     if directive.mode == 'AUTO' then
         if meta == nil then return nil, 'metadata cache empty' end
         if meta.src_pk_col and is_numeric_pk_type(meta.src_pk_type) then
-            return { strategy = 'PK_RANGE', key = meta.src_pk_col }
+            local decision = { strategy = 'PK_RANGE', key = meta.src_pk_col }
+            if meta.src_pk_min ~= nil and meta.src_pk_max ~= nil then
+                decision.lo = meta.src_pk_min
+                decision.hi = meta.src_pk_max
+            end
+            return decision
         end
         if meta.src_date_col then
             return { strategy = 'DATE_BUCKET', key = meta.src_date_col }
@@ -911,7 +960,12 @@ function pick_split_strategy(meta, options, dialect, source_type)
 
     if directive.mode == 'PK' then
         if meta and meta.src_pk_col and is_numeric_pk_type(meta.src_pk_type) then
-            return { strategy = 'PK_RANGE', key = meta.src_pk_col }
+            local decision = { strategy = 'PK_RANGE', key = meta.src_pk_col }
+            if meta.src_pk_min ~= nil and meta.src_pk_max ~= nil then
+                decision.lo = meta.src_pk_min
+                decision.hi = meta.src_pk_max
+            end
+            return decision
         end
         return nil, 'PARALLEL_SPLIT=PK requested but no numeric PK in metadata'
     end
@@ -1006,6 +1060,38 @@ end
 function build_where_for_split(decision, dialect, n, k)
     if decision == nil then return nil end
     if decision.strategy == 'PK_RANGE' or decision.strategy == 'UNIQUE_NUM' then
+        -- BETWEEN path: when min/max are available and dialect supports pk_between.
+        if decision.lo ~= nil and decision.hi ~= nil and dialect and dialect.pk_between then
+            local width = math.ceil((decision.hi - decision.lo + 1) / n)
+            local lo_k = decision.lo + k * width
+            local hi_k = (k == n - 1) and decision.hi or (decision.lo + (k + 1) * width - 1)
+
+            -- Skip buckets that fall entirely beyond max.
+            if lo_k > decision.hi then return nil end
+
+            local clause = dialect.pk_between(decision.key, lo_k, hi_k)
+
+            -- First bucket must also capture NULL rows.
+            if k == 0 then
+                -- Extract quoting style from pk_between output to quote column name for IS NULL.
+                local between_output = dialect.pk_between(decision.key, 1, 1)
+                local quoted_col
+                if between_output:match('^"') then
+                    quoted_col = '"' .. decision.key .. '"'
+                elseif between_output:match('^`') then
+                    quoted_col = '`' .. decision.key .. '`'
+                elseif between_output:match('^%[') then
+                    quoted_col = '[' .. decision.key .. ']'
+                else
+                    quoted_col = '"' .. decision.key .. '"'
+                end
+                clause = '(' .. clause .. ' OR ' .. quoted_col .. ' IS NULL)'
+            end
+
+            return clause
+        end
+
+        -- MOD fallback: when min/max unavailable or dialect lacks pk_between.
         if dialect and dialect.pk_where then
             return dialect.pk_where(decision.key, n, k)
         end
@@ -1123,8 +1209,6 @@ function transform_for_split(res, options, cache, source_type, decisions)
     if cache == nil or not cache.available then return res end
 
     local threshold = parse_threshold(options)
-    if threshold <= 0 then return res end
-
     local dialect = DIALECT_BY_SOURCE[source_type]
     local requested = raw_parallel_requested(options)
 
@@ -1147,17 +1231,17 @@ function transform_for_split(res, options, cache, source_type, decisions)
                         local decision, reason = pick_split_strategy(meta, options, dialect, source_type)
                         if decision ~= nil then
                             local where_per_k = {}
-                            local build_ok = true
                             for k = 0, n - 1 do
                                 local w = build_where_for_split(decision, dialect, n, k)
-                                if w == nil then build_ok = false; break end
-                                where_per_k[#where_per_k + 1] = w
+                                if w ~= nil then
+                                    where_per_k[#where_per_k + 1] = w
+                                end
                             end
-                            if build_ok then
-                                local rewritten = rewrite_import_to_multi_stmt(sql_text, where_per_k, n)
+                            if #where_per_k > 0 then
+                                local rewritten = rewrite_import_to_multi_stmt(sql_text, where_per_k, #where_per_k)
                                 if rewritten ~= nil then
                                     out[i] = replace_row_sql(out[i], rewritten)
-                                    decisions[i] = { strategy = decision.strategy, key = decision.key, requested = resolved.requested, effective = n }
+                                    decisions[i] = { strategy = decision.strategy, key = decision.key, requested = resolved.requested, effective = #where_per_k }
                                 else
                                     info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: rewrite failed for ' .. src_schema .. '.' .. src_table .. ' -- IMPORT left unchanged'
                                     decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }

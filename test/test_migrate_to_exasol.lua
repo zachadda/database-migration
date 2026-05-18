@@ -679,20 +679,22 @@ local function count_clauses(sql)
     return n
 end
 
-test("splitter expands single-statement IMPORT on numeric PK (PK_RANGE)", function()
+test("splitter expands single-statement IMPORT on numeric PK (PK_RANGE) with BETWEEN", function()
     local sql = single_stmt_import("DST", "ORDERS", "PUBLIC", "orders")
     local result = run_migrate({
         source_type = "POSTGRES",
         target_schema = "DST",
         options = "PARALLEL_ROW_THRESHOLD=1000000;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
         adapter_rows = {{SQL_TEXT = sql}},
-        gate_lookup_rows = {{SRC_SCHEMA = "PUBLIC", SRC_TABLE = "orders", SRC_ROWS = 20000000, SRC_PK_COL = "ORDER_ID", SRC_PK_TYPE = "int8"}},
+        gate_lookup_rows = {{SRC_SCHEMA = "PUBLIC", SRC_TABLE = "orders", SRC_ROWS = 4000000, SRC_PK_COL = "ORDER_ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 4000000}},
     })
     local row = find_import_row(result.rows, "DST.ORDERS")
     assert(row, "IMPORT row missing")
     assert_eq(count_clauses(row[6]), 4, "expected 4 STATEMENT clauses; got " .. count_clauses(row[6]))
-    assert_contains(row[6], 'MOD("ORDER_ID", 4) = 0')
-    assert_contains(row[6], 'MOD("ORDER_ID", 4) = 3')
+    assert_contains(row[6], '"ORDER_ID" BETWEEN 1 AND 1000000')
+    assert_contains(row[6], '"ORDER_ID" BETWEEN 1000001 AND 2000000')
+    assert_contains(row[6], '"ORDER_ID" BETWEEN 2000001 AND 3000000')
+    assert_contains(row[6], '"ORDER_ID" BETWEEN 3000001 AND 4000000')
     assert_contains(row[6], '"PUBLIC"."orders"')
     assert_contains(row[6], '"DST"."ORDERS"')
 end)
@@ -1275,6 +1277,115 @@ test("PARALLEL_REQUESTED records explicit integer literally", function()
     assert_eq(row[10], "8", "PARALLEL_REQUESTED must be raw literal '8'")
     assert_eq(row[11], 8)
     assert_eq(count_clauses(row[6]), 8)
+end)
+
+print("")
+print("=== PK_RANGE BETWEEN Pushdown Tests ===")
+
+test("PK_RANGE BETWEEN with width rounding: 1..10 into 3 buckets", function()
+    local sql = single_stmt_import("DST", "LEDGER", "SMOKE", "LEDGER")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=3;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{SRC_SCHEMA = "SMOKE", SRC_TABLE = "LEDGER", SRC_ROWS = 10, SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 10}},
+    })
+    local row = find_import_row(result.rows, "DST.LEDGER")
+    assert(row, "IMPORT row missing")
+    assert_eq(count_clauses(row[6]), 3, "expected 3 STATEMENT clauses")
+    assert_contains(row[6], '"ID" BETWEEN 1 AND 4')
+    assert_contains(row[6], '"ID" BETWEEN 5 AND 8')
+    assert_contains(row[6], '"ID" BETWEEN 9 AND 10')
+    assert_eq(row[11], 3, "PARALLEL_EFFECTIVE should be 3")
+end)
+
+test("PK_RANGE BETWEEN degenerate range (min == max) emits one bucket", function()
+    local sql = single_stmt_import("DST", "SINGLETON", "SMOKE", "SINGLETON")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{SRC_SCHEMA = "SMOKE", SRC_TABLE = "SINGLETON", SRC_ROWS = 1, SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 42, SRC_PK_MAX = 42}},
+    })
+    local row = find_import_row(result.rows, "DST.SINGLETON")
+    assert(row, "IMPORT row missing")
+    assert_eq(count_clauses(row[6]), 1, "degenerate range should emit 1 clause")
+    assert_contains(row[6], '"ID" BETWEEN 42 AND 42')
+    assert_eq(row[11], 1, "PARALLEL_EFFECTIVE should be 1")
+end)
+
+test("PK_RANGE BETWEEN NULL PK rows: k=0 appends 'OR ... IS NULL'", function()
+    local sql = single_stmt_import("DST", "ORDERS", "PUBLIC", "orders")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=2;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{SRC_SCHEMA = "PUBLIC", SRC_TABLE = "orders", SRC_ROWS = 100, SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 100}},
+    })
+    local row = find_import_row(result.rows, "DST.ORDERS")
+    assert_contains(row[6], '("ID" BETWEEN 1 AND 50 OR "ID" IS NULL)', "k=0 should append IS NULL check")
+    assert_contains(row[6], '"ID" BETWEEN 51 AND 100', "k=1 should not have IS NULL")
+end)
+
+test("PK_RANGE BETWEEN range smaller than N: 1..2 into 4 buckets yields 2 clauses", function()
+    local sql = single_stmt_import("DST", "TINY", "SMOKE", "TINY")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{SRC_SCHEMA = "SMOKE", SRC_TABLE = "TINY", SRC_ROWS = 2, SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = 1, SRC_PK_MAX = 2}},
+    })
+    local row = find_import_row(result.rows, "DST.TINY")
+    assert(row, "IMPORT row missing")
+    assert_eq(count_clauses(row[6]), 2, "range 1..2 should yield 2 buckets (not 4)")
+    assert_eq(row[11], 2, "PARALLEL_EFFECTIVE should be 2")
+end)
+
+test("PK_RANGE MOD fallback when src_pk_min is NULL", function()
+    local sql = single_stmt_import("DST", "HEAP_T", "SMOKE", "HEAP_T")
+    local result = run_migrate({
+        source_type = "POSTGRES",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=4;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{SRC_SCHEMA = "SMOKE", SRC_TABLE = "HEAP_T", SRC_ROWS = 1000, SRC_PK_COL = "ID", SRC_PK_TYPE = "int8", SRC_PK_MIN = nil, SRC_PK_MAX = nil}},
+    })
+    local row = find_import_row(result.rows, "DST.HEAP_T")
+    assert(row, "IMPORT row missing")
+    assert_eq(count_clauses(row[6]), 4, "expected 4 MOD clauses (fallback)")
+    assert_contains(row[6], 'MOD("ID", 4) = 0', "should use Postgres double-quote MOD fallback")
+    assert_eq(row[8], "PK_RANGE", "SPLIT_STRATEGY should still be PK_RANGE")
+end)
+
+test("PK_RANGE BETWEEN MySQL backtick quoting", function()
+    local sql = single_stmt_import("DST", "orders", "app", "orders")
+    local result = run_migrate({
+        source_type = "MYSQL",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=2;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{SRC_SCHEMA = "app", SRC_TABLE = "orders", SRC_ROWS = 100, SRC_PK_COL = "id", SRC_PK_TYPE = "int", SRC_PK_MIN = 1, SRC_PK_MAX = 100}},
+    })
+    local row = find_import_row(result.rows, "DST.orders")
+    assert_contains(row[6], '`id` BETWEEN 1 AND 50', "MySQL should use backtick BETWEEN")
+    assert_contains(row[6], '(`id` BETWEEN 1 AND 50 OR `id` IS NULL)', "k=0 with MySQL backticks")
+end)
+
+test("PK_RANGE BETWEEN SQL Server bracket quoting", function()
+    local sql = single_stmt_import("DST", "Orders", "dbo", "Orders")
+    local result = run_migrate({
+        source_type = "SQLSERVER",
+        target_schema = "DST",
+        options = "PARALLEL_ROW_THRESHOLD=0;PARALLEL_STATEMENTS=2;PARALLEL_SPLIT=AUTO",
+        adapter_rows = {{SQL_TEXT = sql}},
+        gate_lookup_rows = {{SRC_SCHEMA = "dbo", SRC_TABLE = "Orders", SRC_ROWS = 100, SRC_PK_COL = "Id", SRC_PK_TYPE = "int", SRC_PK_MIN = 1, SRC_PK_MAX = 100}},
+    })
+    local row = find_import_row(result.rows, "DST.Orders")
+    assert_contains(row[6], '[Id] BETWEEN 1 AND 50', "SQL Server should use bracket BETWEEN")
 end)
 
 print("")
