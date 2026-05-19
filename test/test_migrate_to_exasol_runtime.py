@@ -136,7 +136,7 @@ def main() -> int:
             raise AssertionError(f"{source} missing SUMMARY/PREVIEW tail row: {rows[-1]}")
     print(f"preview_dispatch={len(ADAPTERS)}")
 
-    for source in ("MYSQL", "SNOWFLAKE", "DATABRICKS", "ORACLE"):
+    for source in ("MYSQL", "SNOWFLAKE", "DATABRICKS", "ORACLE", "STARROCKS", "CLICKHOUSE", "DREMIO", "TRINO"):
         rows = conn.execute(wrapper_call(source, debug=False)).fetchall()
         summary = rows[-1]
         if summary[0] != "SUMMARY" or summary[4] != "OK":
@@ -150,7 +150,7 @@ def main() -> int:
         for required in ("CREATE_SCHEMA", "CREATE_TABLE", "IMPORT", "SUMMARY"):
             if required not in kinds:
                 raise AssertionError(f"{source} missing STEP_KIND={required}; got {kinds}")
-    print("execute_representative=4")
+    print("execute_representative=8")
 
     rows = conn.execute(wrapper_call("MYSQL", debug=False, table_filter="EMPTY")).fetchall()
     summary = rows[-1]
