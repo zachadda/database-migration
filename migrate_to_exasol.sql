@@ -21,7 +21,8 @@ create or replace script database_migration.MIGRATE_TO_EXASOL(
     TARGET_SCHEMA,                -- target schema override where supported, or NULL
     IDENTIFIER_CASE_INSENSITIVE,  -- TRUE stores generated identifiers uppercase
     DEBUG,                        -- TRUE previews generated SQL, FALSE executes it
-    OPTIONS                       -- source-specific KEY=VALUE pairs separated by semicolons
+    OPTIONS,                      -- source-specific KEY=VALUE pairs separated by semicolons
+    ADAPTER_SCHEMA                -- schema where adapter scripts are installed (default: 'database_migration')
 ) RETURNS TABLE
 AS
 
@@ -1798,41 +1799,42 @@ local target_schema = blank_to_nil(TARGET_SCHEMA)
 local identifier_case_insensitive = parse_bool(IDENTIFIER_CASE_INSENSITIVE, true, 'IDENTIFIER_CASE_INSENSITIVE')
 local debug = parse_bool(DEBUG, true, 'DEBUG')
 local options = parse_options(OPTIONS)
+local adapter_schema = blank_to_nil(ADAPTER_SCHEMA) or 'database_migration'
 
 validate_parallel_options(options)
 
 local adapter_sql = nil
 
 if source == 'MYSQL' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.MYSQL_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.MYSQL_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'DUCKDB' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.DUCKDB_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.DUCKDB_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'STARROCKS' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.STARROCKS_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.STARROCKS_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'CLICKHOUSE' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.CLICKHOUSE_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.CLICKHOUSE_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'DREMIO' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.DREMIO_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.DREMIO_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(db_filter) .. ','
@@ -1840,7 +1842,7 @@ elseif source == 'DREMIO' then
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'TRINO' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.TRINO_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.TRINO_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(db_filter) .. ','
@@ -1848,14 +1850,14 @@ elseif source == 'TRINO' then
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'MARIADB' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.MARIADB_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.MARIADB_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'POSTGRES' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.POSTGRES_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.POSTGRES_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
@@ -1863,35 +1865,35 @@ elseif source == 'POSTGRES' then
         .. sql_string(target_schema) .. ')'
 
 elseif source == 'REDSHIFT' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.REDSHIFT_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.REDSHIFT_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'DB2' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.DB2_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.DB2_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'VERTICA' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.VERTICA_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.VERTICA_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'HANA' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.HANA_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.HANA_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'AZURE_SQL' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.AZURE_SQL_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.AZURE_SQL_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ','
@@ -1904,7 +1906,7 @@ elseif source == 'BIGQUERY' then
     end
     project_id = require_value(project_id, 'OPTIONS PROJECT_ID for BIGQUERY')
 
-    adapter_sql = 'EXECUTE SCRIPT database_migration.BIGQUERY_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.BIGQUERY_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(project_id) .. ','
@@ -1912,7 +1914,7 @@ elseif source == 'BIGQUERY' then
         .. sql_string(table_filter) .. ')'
 
 elseif source == 'DATABRICKS' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.DATABRICKS_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.DATABRICKS_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(opt_bool(options, 'CATALOG2SCHEMA', true)) .. ','
         .. sql_string(db_filter) .. ','
@@ -1922,7 +1924,7 @@ elseif source == 'DATABRICKS' then
         .. sql_bool(identifier_case_insensitive) .. ')'
 
 elseif source == 'SQLSERVER' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.SQLSERVER_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.SQLSERVER_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(opt_bool(options, 'DB2SCHEMA', false)) .. ','
         .. sql_string(db_filter) .. ','
@@ -1932,7 +1934,7 @@ elseif source == 'SQLSERVER' then
         .. sql_bool(identifier_case_insensitive) .. ')'
 
 elseif source == 'SNOWFLAKE' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.SNOWFLAKE_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.SNOWFLAKE_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(opt_bool(options, 'DB2SCHEMA', false)) .. ','
         .. sql_string(db_filter) .. ','
@@ -1942,7 +1944,7 @@ elseif source == 'SNOWFLAKE' then
         .. sql_bool(identifier_case_insensitive) .. ')'
 
 elseif source == 'ORACLE' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.ORACLE_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.ORACLE_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
@@ -1953,7 +1955,7 @@ elseif source == 'ORACLE' then
         .. sql_bool(opt_bool(options, 'CHECK_MIGRATION', false)) .. ')'
 
 elseif source == 'TERADATA' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.TERADATA_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.TERADATA_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
@@ -1961,7 +1963,7 @@ elseif source == 'TERADATA' then
         .. sql_bool(opt_bool(options, 'CHECK_MIGRATION', false)) .. ')'
 
 elseif source == 'EXASOL' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.EXASOL_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.EXASOL_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_string(connection_type) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
@@ -1972,7 +1974,7 @@ elseif source == 'EXASOL' then
         .. sql_string(opt(options, 'PK_SETTING', 'DISABLE')) .. ')'
 
 elseif source == 'NETEZZA' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.NETEZZA_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.NETEZZA_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_string(db_filter) .. ','
         .. sql_string(schema_filter) .. ','
@@ -1980,7 +1982,7 @@ elseif source == 'NETEZZA' then
         .. sql_bool(identifier_case_insensitive) .. ')'
 
 elseif source == 'VECTORWISE' then
-    adapter_sql = 'EXECUTE SCRIPT database_migration.VECTORWISE_TO_EXASOL('
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.VECTORWISE_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(table_filter) .. ')'

@@ -104,7 +104,8 @@ def wrapper_call(source: str, debug: bool, table_filter: str = "TBL") -> str:
         "'TARGET_SCHEMA',"
         "TRUE,"
         f"{'TRUE' if debug else 'FALSE'},"
-        "'PROJECT_ID=PROJECT;CATALOG2SCHEMA=true'"
+        "'PROJECT_ID=PROJECT;CATALOG2SCHEMA=true',"
+        "'database_migration'"
         ")"
     )
 
