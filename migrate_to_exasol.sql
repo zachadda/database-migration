@@ -147,6 +147,8 @@ function normalize_source_type(source_type)
         return 'NETEZZA'
     elseif source == 'ACTIAN' or source == 'ACTIAN_VECTOR' then
         return 'VECTORWISE'
+    elseif source == 'DUCK_DB' then
+        return 'DUCKDB'
     end
 
     return source
@@ -1795,6 +1797,13 @@ local adapter_sql = nil
 
 if source == 'MYSQL' then
     adapter_sql = 'EXECUTE SCRIPT database_migration.MYSQL_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'DUCKDB' then
+    adapter_sql = 'EXECUTE SCRIPT database_migration.DUCKDB_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
         .. sql_string(schema_filter) .. ','
