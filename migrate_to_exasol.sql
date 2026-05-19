@@ -328,7 +328,7 @@ end
 SOURCE_METADATA_BY_SOURCE = {
     ORACLE = {
         mode = 'sql',
-        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(2000000)) /* src_partitions */ from all_tables where (<PREDICATE>)",
+        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(8000)) /* src_partitions */ from all_tables where (<PREDICATE>)",
         pair = "(owner = '%s' and table_name = '%s')",
     },
     POSTGRES = {
@@ -378,7 +378,7 @@ SOURCE_METADATA_BY_SOURCE = {
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and ty.name in ('date','datetime','datetime2','smalldatetime','datetimeoffset','time') order by (case when lower(c2.name) like '%date' or lower(c2.name) like '%dt' or lower(c2.name) like '%time' or lower(c2.name) like '%day' or lower(c2.name) like '%created' or lower(c2.name) like '%loaded' or lower(c2.name) like '%event' or lower(c2.name) like '%posted' then 0 else 1 end), c2.column_id) as src_date_col,"
             .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and c2.is_nullable = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') order by c2.column_id) as src_num_col,"
             .. " cast(case when exists(select 1 from sys.partitions p where p.object_id = t.object_id and p.partition_number > 1) then 1 else 0 end as bit) as src_partitioned,"
-            .. " cast(case when exists(select 1 from sys.partitions p where p.object_id = t.object_id and p.partition_number > 1) then (select string_agg(concat('{\"name\":\"', p.name, '\",\"predicate\":\"\\$partition.', pf.name, '([', parameter_col.name, ']) = ', p.partition_number, '\"}'), ',') within group (order by p.partition_number) from sys.partitions p join sys.partition_schemes ps on ps.partition_scheme_id = (select partition_scheme_id from sys.tables where object_id = t.object_id) join sys.partition_functions pf on pf.function_id = ps.function_id join sys.partition_parameters pp on pp.function_id = pf.function_id join sys.columns parameter_col on parameter_col.object_id = t.object_id and parameter_col.column_id = pp.parameter_id where p.object_id = t.object_id and p.partition_number > 1) else NULL end as varchar(2000000)) as src_partitions"
+            .. " cast(NULL as varchar(8000)) as src_partitions"
             .. " from sys.tables t join sys.schemas s on s.schema_id = t.schema_id where (<PREDICATE>)",
         pair = "(s.name = '%s' and t.name = '%s')",
     },
@@ -409,7 +409,7 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     VERTICA = {
         mode = 'sql',
-        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(2000000)) /* src_partitions */ from projection_storage where (<PREDICATE>)",
+        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(8000)) /* src_partitions */ from projection_storage where (<PREDICATE>)",
         pair = "(projection_schema = '%s' and anchor_table_name = '%s')",
     },
     DB2 = {
@@ -434,7 +434,7 @@ SOURCE_METADATA_BY_SOURCE = {
     },
     DATABRICKS = {
         mode = 'sql',
-        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(2000000)) /* src_partitions */ from information_schema.tables where (<PREDICATE>)",
+        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(8000)) /* src_partitions */ from information_schema.tables where (<PREDICATE>)",
         pair = "(table_schema = '%s' and table_name = '%s')",
     },
 }
