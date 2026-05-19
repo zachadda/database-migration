@@ -149,6 +149,14 @@ function normalize_source_type(source_type)
         return 'VECTORWISE'
     elseif source == 'DUCK_DB' then
         return 'DUCKDB'
+    elseif source == 'STAR_ROCKS' then
+        return 'STARROCKS'
+    elseif source == 'CLICKHOUSE' then
+        return 'CLICKHOUSE'
+    elseif source == 'DREMIO' then
+        return 'DREMIO'
+    elseif source == 'TRINO' then
+        return 'TRINO'
     end
 
     return source
@@ -1806,6 +1814,36 @@ elseif source == 'DUCKDB' then
     adapter_sql = 'EXECUTE SCRIPT database_migration.DUCKDB_TO_EXASOL('
         .. sql_string(connection_name) .. ','
         .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'STARROCKS' then
+    adapter_sql = 'EXECUTE SCRIPT database_migration.STARROCKS_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'CLICKHOUSE' then
+    adapter_sql = 'EXECUTE SCRIPT database_migration.CLICKHOUSE_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'DREMIO' then
+    adapter_sql = 'EXECUTE SCRIPT database_migration.DREMIO_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'TRINO' then
+    adapter_sql = 'EXECUTE SCRIPT database_migration.TRINO_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(db_filter) .. ','
         .. sql_string(schema_filter) .. ','
         .. sql_string(table_filter) .. ')'
 
