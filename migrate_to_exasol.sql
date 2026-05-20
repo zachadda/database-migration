@@ -1,0 +1,2046 @@
+create schema if not exists database_migration;
+
+/*
+    Unified entry point for database migration scripts.
+
+    This script keeps the existing source-specific scripts intact and exposes one
+    standardized call surface. It dispatches to the current adapter script, then
+    either returns generated SQL (DEBUG = TRUE) or executes generated SQL
+    (DEBUG = FALSE).
+
+    Source-specific settings live in OPTIONS as key=value pairs separated by ';'.
+*/
+--/
+create or replace script database_migration.MIGRATE_TO_EXASOL(
+    SOURCE_TYPE,                  -- migration source, e.g. MYSQL, POSTGRES, DATABRICKS, SNOWFLAKE
+    CONNECTION_NAME,              -- name of the source database connection inside Exasol
+    CONNECTION_TYPE,              -- Exasol-to-Exasol only: JDBC or EXA
+    DB_FILTER,                    -- database/catalog filter where supported, else '%'
+    SCHEMA_FILTER,                -- schema filter, e.g. 'MY_SCHEMA', 'MART_%', or '%'
+    TABLE_FILTER,                 -- table filter, e.g. 'MY_TABLE', 'FACT_%', or '%'
+    TARGET_SCHEMA,                -- target schema override where supported, or NULL
+    IDENTIFIER_CASE_INSENSITIVE,  -- TRUE stores generated identifiers uppercase
+    DEBUG,                        -- TRUE previews generated SQL, FALSE executes it
+    OPTIONS,                      -- source-specific KEY=VALUE pairs separated by semicolons
+    ADAPTER_SCHEMA                -- schema where adapter scripts are installed (default: 'database_migration')
+) RETURNS TABLE
+AS
+
+local OUT_COLUMNS = "STEP_KIND VARCHAR(40), TARGET_OBJ VARCHAR(2000), ROWS_AFFECTED DECIMAL(18,0), ELAPSED_MS DECIMAL(18,0), RESULT_FLAG VARCHAR(20), SQL_TEXT VARCHAR(2000000), ERROR_MESSAGE VARCHAR(20000), SPLIT_STRATEGY VARCHAR(32), SPLIT_KEY VARCHAR(256), PARALLEL_REQUESTED VARCHAR(16), PARALLEL_EFFECTIVE DECIMAL(4,0)"
+
+function is_null(value)
+    return value == nil or value == null or value == NULL
+end
+
+function trim(value)
+    if is_null(value) then
+        return nil
+    end
+    return tostring(value):gsub("^%s*(.-)%s*$", "%1")
+end
+
+function blank_to_nil(value)
+    local result = trim(value)
+    if result == nil or result == '' then
+        return nil
+    end
+    return result
+end
+
+function escape_sql_literal(value)
+    return tostring(value):gsub("'", "''")
+end
+
+function sql_string(value)
+    local result = blank_to_nil(value)
+    if result == nil then
+        return "NULL"
+    end
+    return "'" .. escape_sql_literal(result) .. "'"
+end
+
+function sql_bool(value)
+    if value then
+        return "TRUE"
+    end
+    return "FALSE"
+end
+
+function parse_bool(value, default_value, param_name)
+    if is_null(value) or blank_to_nil(value) == nil then
+        return default_value
+    end
+    if type(value) == 'boolean' then
+        return value
+    end
+
+    local normalized = string.upper(trim(value))
+    if normalized == 'TRUE' or normalized == 'T' or normalized == 'YES' or normalized == 'Y' or normalized == '1' then
+        return true
+    elseif normalized == 'FALSE' or normalized == 'F' or normalized == 'NO' or normalized == 'N' or normalized == '0' then
+        return false
+    end
+
+    error('Invalid boolean for ' .. param_name .. ': ' .. tostring(value))
+end
+
+function parse_options(raw_options)
+    local parsed = {}
+    local raw = blank_to_nil(raw_options)
+    if raw == nil then
+        return parsed
+    end
+
+    for entry in string.gmatch(raw, "([^;]+)") do
+        local key, value = entry:match("^%s*([^=]+)%s*=%s*(.-)%s*$")
+        if key == nil then
+            error('Invalid OPTIONS entry: ' .. entry .. '. Use KEY=VALUE pairs separated by semicolons.')
+        end
+        parsed[string.upper(trim(key))] = trim(value)
+    end
+
+    return parsed
+end
+
+function opt(options, key, default_value)
+    local value = options[string.upper(key)]
+    if blank_to_nil(value) == nil then
+        return default_value
+    end
+    return value
+end
+
+function opt_bool(options, key, default_value)
+    return parse_bool(opt(options, key, nil), default_value, key)
+end
+
+function opt_sql_number(options, key, default_value)
+    local value = opt(options, key, default_value)
+    if blank_to_nil(value) == nil then
+        return "NULL"
+    end
+    local number_value = tonumber(value)
+    if number_value == nil then
+        error('Invalid numeric option ' .. key .. ': ' .. tostring(value))
+    end
+    return tostring(number_value)
+end
+
+function normalize_source_type(source_type)
+    local source = string.upper(blank_to_nil(source_type) or '')
+    source = source:gsub("%s+", "_"):gsub("-", "_")
+
+    if source == 'AZURESQL' or source == 'AZURE_SQL_SERVER' then
+        return 'AZURE_SQL'
+    elseif source == 'BIG_QUERY' or source == 'GOOGLE_BIGQUERY' or source == 'GOOGLE_BIG_QUERY' then
+        return 'BIGQUERY'
+    elseif source == 'DBX' or source == 'DATABRICKS_SQL' then
+        return 'DATABRICKS'
+    elseif source == 'POSTGRESQL' then
+        return 'POSTGRES'
+    elseif source == 'SQL_SERVER' or source == 'MSSQL' or source == 'MICROSOFT_SQL_SERVER' then
+        return 'SQLSERVER'
+    elseif source == 'SAP_HANA' or source == 'SAPHANA' then
+        return 'HANA'
+    elseif source == 'EXA' then
+        return 'EXASOL'
+    elseif source == 'NZ' then
+        return 'NETEZZA'
+    elseif source == 'ACTIAN' or source == 'ACTIAN_VECTOR' then
+        return 'VECTORWISE'
+    elseif source == 'DUCK_DB' then
+        return 'DUCKDB'
+    elseif source == 'STAR_ROCKS' then
+        return 'STARROCKS'
+    elseif source == 'CLICKHOUSE' then
+        return 'CLICKHOUSE'
+    elseif source == 'DREMIO' then
+        return 'DREMIO'
+    elseif source == 'TRINO' then
+        return 'TRINO'
+    end
+
+    return source
+end
+
+function require_value(value, name)
+    local result = blank_to_nil(value)
+    if result == nil then
+        error(name .. ' is required')
+    end
+    return result
+end
+
+function first_sql_text(row)
+    if row.SQL_TEXT ~= nil then
+        return row.SQL_TEXT
+    end
+    if row[1] ~= nil then
+        return row[1]
+    end
+    return tostring(row)
+end
+
+function classify_step(sql_text)
+    local text = blank_to_nil(sql_text)
+    if text == nil then
+        return 'INFO'
+    end
+    if string.sub(text, 1, 2) == '--' then
+        return 'INFO'
+    end
+    local lower = string.lower(text)
+    if string.find(lower, '^%s*create%s+schema') then
+        return 'CREATE_SCHEMA'
+    elseif string.find(lower, '^%s*create%s+or%s+replace%s+table')
+        or string.find(lower, '^%s*create%s+table') then
+        return 'CREATE_TABLE'
+    elseif string.find(lower, '^%s*alter%s+table') then
+        return 'ALTER_TABLE'
+    elseif string.find(lower, '^%s*import%s+into') then
+        return 'IMPORT'
+    elseif string.find(lower, '^%s*insert%s+into') then
+        return 'IMPORT'
+    end
+    return 'OTHER'
+end
+
+function extract_target_obj(sql_text, step_kind)
+    local text = blank_to_nil(sql_text)
+    if text == nil then
+        return NULL
+    end
+    if step_kind == 'CREATE_SCHEMA' then
+        local schema = text:match('[Cc][Rr][Ee][Aa][Tt][Ee]%s+[Ss][Cc][Hh][Ee][Mm][Aa]%s+[Ii][Ff]%s+[Nn][Oo][Tt]%s+[Ee][Xx][Ii][Ss][Tt][Ss]%s+"([^"]+)"')
+            or text:match('[Cc][Rr][Ee][Aa][Tt][Ee]%s+[Ss][Cc][Hh][Ee][Mm][Aa]%s+"([^"]+)"')
+            or text:match('[Cc][Rr][Ee][Aa][Tt][Ee]%s+[Ss][Cc][Hh][Ee][Mm][Aa]%s+([%w_]+)')
+        if schema then return schema end
+    elseif step_kind == 'CREATE_TABLE' or step_kind == 'ALTER_TABLE' or step_kind == 'IMPORT' then
+        local schema, table_name = text:match('"([^"]+)"%."([^"]+)"')
+        if schema and table_name then return schema .. '.' .. table_name end
+    end
+    return NULL
+end
+
+function is_executable_statement(sql_text)
+    local text = blank_to_nil(sql_text)
+    if text == nil then
+        return false
+    end
+    return string.sub(text, 1, 2) ~= '--'
+end
+
+function audit_or_nulls(audit)
+    if audit == nil then
+        return NULL, NULL, NULL, NULL
+    end
+    local strategy = audit.strategy
+    if strategy == nil then strategy = NULL end
+    local key = audit.key
+    if key == nil then key = NULL end
+    local requested = audit.requested
+    if requested == nil then requested = NULL end
+    local effective = audit.effective
+    if effective == nil then effective = NULL end
+    return strategy, key, requested, effective
+end
+
+function build_row(step_kind, target_obj, rows_affected, elapsed_ms, result_flag, sql_text, error_message, audit)
+    local strategy, key, requested, effective = audit_or_nulls(audit)
+    return {step_kind, target_obj, rows_affected, elapsed_ms, result_flag, sql_text, error_message, strategy, key, requested, effective}
+end
+
+function append_info_row(info_rows, text, state)
+    info_rows[#info_rows + 1] = text
+    if state then
+        state.has_warnings = true
+    end
+end
+
+
+function normalize_rows(res, decisions, state)
+    decisions = decisions or {}
+    state = state or {}
+    local summary = {}
+    local tables_count = 0
+    for i = 1, #res do
+        local row = res[i]
+        local sql_text = first_sql_text(row)
+        local kind = classify_step(sql_text)
+        local target = extract_target_obj(sql_text, kind)
+        if kind == 'CREATE_TABLE' then
+            tables_count = tables_count + 1
+        end
+        local flag = row.RESULT_FLAG or row.SUCCESS or row[5] or row[2] or 'PREVIEW'
+        local err = row.ERROR_MESSAGE or row[7] or row[3] or NULL
+        summary[#summary + 1] = build_row(kind, target, NULL, NULL, flag, sql_text, err, decisions[i])
+    end
+    local summary_text = 'Plan: ' .. tables_count .. ' table(s) to create'
+    if state.has_warnings then
+        summary_text = summary_text .. ' (completed with warnings)'
+    end
+    summary[#summary + 1] = build_row('SUMMARY', summary_text, NULL, NULL, 'PREVIEW', NULL, NULL)
+    return summary
+end
+
+function execute_generated_sql(res, decisions, state)
+    decisions = decisions or {}
+    state = state or {}
+    local summary = {}
+    local fail_count = 0
+    local executed_count = 0
+    local tables_created = 0
+    local total_rows = 0
+    local total_elapsed = 0
+
+    for i = 1, #res do
+        local sql_text = first_sql_text(res[i])
+        local kind = classify_step(sql_text)
+        local target = extract_target_obj(sql_text, kind)
+        local audit = decisions[i]
+        if is_executable_statement(sql_text) then
+            executed_count = executed_count + 1
+            local t0 = os.clock()
+            local success, info = pquery(sql_text)
+            local elapsed = math.floor((os.clock() - t0) * 1000)
+            total_elapsed = total_elapsed + elapsed
+            if success then
+                local rows_affected = NULL
+                if info ~= nil and info.rows_affected ~= nil then
+                    rows_affected = tonumber(info.rows_affected) or NULL
+                    if kind == 'IMPORT' and type(rows_affected) == 'number' then
+                        total_rows = total_rows + rows_affected
+                    end
+                end
+                if kind == 'CREATE_TABLE' then
+                    tables_created = tables_created + 1
+                end
+                summary[#summary + 1] = build_row(kind, target, rows_affected, elapsed, 'OK', sql_text, NULL, audit)
+            else
+                fail_count = fail_count + 1
+                summary[#summary + 1] = build_row(kind, target, NULL, elapsed, 'ERROR', sql_text, info.error_message, audit)
+            end
+        else
+            summary[#summary + 1] = build_row(kind, target, NULL, NULL, 'SKIPPED', sql_text, NULL, audit)
+        end
+    end
+
+    local summary_obj
+    local summary_flag
+    if executed_count == 0 then
+        summary_obj = 'No executable SQL generated'
+        summary_flag = 'SKIPPED'
+    elseif fail_count == 0 then
+        summary_obj = 'Completed: ' .. tables_created .. ' table(s), ' .. total_rows .. ' row(s) loaded'
+        summary_flag = 'OK'
+    else
+        summary_obj = 'Completed with ' .. fail_count .. ' error(s); ' .. tables_created .. ' table(s) created, ' .. total_rows .. ' row(s) loaded'
+        summary_flag = 'ERROR'
+    end
+    if state.has_warnings then
+        summary_obj = summary_obj .. ' (completed with warnings)'
+    end
+    summary[#summary + 1] = build_row('SUMMARY', summary_obj, total_rows, total_elapsed, summary_flag, NULL, NULL)
+
+    return summary
+end
+
+-- Per-source metadata SQL. Each template returns 8 columns in this order:
+--   src_schema, src_table, src_rows,
+--   src_pk_col, src_pk_type, src_date_col, src_num_col, src_partitioned
+-- Tier 0 sources (POSTGRES, MYSQL, SQLSERVER, SNOWFLAKE) populate all eight columns.
+-- Other sources currently emit only src_rows; splitter falls through to ROWID
+-- or SINGLE depending on dialect capabilities.
+-- BIGQUERY remains skip_with_info: BQ INFORMATION_SCHEMA is dataset-scoped, and
+-- the cross-dataset round-trip needs per-dataset query orchestration not yet built.
+SOURCE_METADATA_BY_SOURCE = {
+    ORACLE = {
+        mode = 'sql',
+        template = "select owner, table_name, num_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(8000)) /* src_partitions */ from all_tables where (<PREDICATE>)",
+        pair = "(owner = '%s' and table_name = '%s')",
+    },
+    POSTGRES = {
+        mode = 'sql',
+        needs_min_max_pass = true,
+        template = "select n.nspname, c.relname, c.reltuples::bigint,"
+            .. " (select a.attname::text from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = con.conkey[1] where con.conrelid = c.oid and con.contype = 'p' and array_length(con.conkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) limit 1),"
+            .. " (select format_type(a.atttypid, a.atttypmod) from pg_constraint con join pg_attribute a on a.attrelid = con.conrelid and a.attnum = con.conkey[1] where con.conrelid = c.oid and con.contype = 'p' and array_length(con.conkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) limit 1),"
+            .. " NULL, NULL,"
+            .. " (select a.attname::text from pg_attribute a join pg_index idx on idx.indrelid = a.attrelid and a.attnum = ANY(idx.indkey) where a.attrelid = c.oid and idx.indisunique and NOT idx.indisprimary and array_length(idx.indkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) order by idx.indexrelid limit 1),"
+            .. " (select format_type(a.atttypid, a.atttypmod) from pg_attribute a join pg_index idx on idx.indrelid = a.attrelid and a.attnum = ANY(idx.indkey) where a.attrelid = c.oid and idx.indisunique and NOT idx.indisprimary and array_length(idx.indkey, 1) = 1 and a.atttypid in (20, 21, 23, 700, 701, 1700) order by idx.indexrelid limit 1),"
+            .. " NULL, NULL,"
+            .. " (select a.attname::text from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.atttypid in (1082, 1114, 1184) order by (case when a.attname ~* '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), a.attnum limit 1),"
+            .. " (select a.attname::text from pg_attribute a where a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped and a.attnotnull and a.atttypid in (20, 21, 23, 700, 701, 1700) order by a.attnum limit 1),"
+            .. " (c.relkind = 'p'),"
+            .. " (case when (c.relkind = 'p') then '[' || string_agg('{\"name\":\"' || pc.relname || '\",\"predicate\":\"tableoid::regclass = ' || quote_literal(pc.relname::text) || '::regclass\"}', ',') || ']' else NULL end)"
+            .. " from pg_class c join pg_namespace n on n.oid = c.relnamespace left join pg_inherits inh on inh.inhparent = c.oid left join pg_class pc on pc.oid = inh.inhrelid where c.relkind in ('r','p') and (<PREDICATE>) group by c.oid, n.nspname, c.relname, c.relkind, c.reltuples",
+        pair = "(n.nspname = '%s' and c.relname = '%s')",
+    },
+    MYSQL = {
+        mode = 'sql',
+        needs_min_max_pass = true,
+        template = "select t.table_schema, t.table_name, t.table_rows,"
+            .. " (select kcu.column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name join information_schema.columns col on col.table_schema = kcu.table_schema and col.table_name = kcu.table_name and col.column_name = kcu.column_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name and col.data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') and kcu.constraint_name in (select constraint_name from information_schema.key_column_usage where table_schema = t.table_schema and table_name = t.table_name group by constraint_name having count(*) = 1) limit 1),"
+            .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select kcu.column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name limit 1) limit 1),"
+            .. " NULL, NULL,"
+            .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') and is_nullable = 'NO' and column_name not in (select column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name) and column_name in (select column_name from information_schema.statistics where table_schema = t.table_schema and table_name = t.table_name and non_unique = 0 and seq_in_index = 1) limit 1),"
+            .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') and is_nullable = 'NO' and column_name not in (select column_name from information_schema.key_column_usage kcu join information_schema.table_constraints tc on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema and tc.table_name = kcu.table_name where tc.constraint_type = 'PRIMARY KEY' and kcu.table_schema = t.table_schema and kcu.table_name = t.table_name) and column_name in (select column_name from information_schema.statistics where table_schema = t.table_schema and table_name = t.table_name and non_unique = 0 and seq_in_index = 1) limit 1) limit 1),"
+            .. " NULL, NULL,"
+            .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('date','datetime','timestamp') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1),"
+            .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('tinyint','smallint','mediumint','int','bigint','decimal','numeric','float','double') order by ordinal_position limit 1),"
+            .. " (case when (select count(*) from information_schema.partitions where table_schema = t.table_schema and table_name = t.table_name and partition_name is not null) > 0 then true else false end),"
+            .. " cast(NULL as char)"
+            .. " from information_schema.tables t where (<PREDICATE>)",
+        pair = "(t.table_schema = '%s' and t.table_name = '%s')",
+    },
+    SQLSERVER = {
+        mode = 'sql',
+        needs_min_max_pass = true,
+        template = "select s.name as src_schema, t.name as src_table, cast(isnull((select sum(p.rows) from sys.partitions p where p.object_id = t.object_id and p.index_id in (0,1)), 0) as bigint) as src_rows,"
+            .. " (select top 1 c2.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_primary_key = 1 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_pk_col,"
+            .. " (select top 1 ty.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_primary_key = 1 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_pk_type,"
+            .. " NULL, NULL,"
+            .. " (select top 1 c2.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_unique = 1 and i.is_primary_key = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_unique_num_col,"
+            .. " (select top 1 ty.name from sys.indexes i join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id join sys.columns c2 on c2.object_id = ic.object_id and c2.column_id = ic.column_id join sys.types ty on ty.user_type_id = c2.user_type_id where i.object_id = t.object_id and i.is_unique = 1 and i.is_primary_key = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') and (select count(*) from sys.index_columns ic2 where ic2.object_id = i.object_id and ic2.index_id = i.index_id) = 1) as src_unique_num_type,"
+            .. " NULL, NULL,"
+            .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and ty.name in ('date','datetime','datetime2','smalldatetime','datetimeoffset','time') order by (case when lower(c2.name) like '%date' or lower(c2.name) like '%dt' or lower(c2.name) like '%time' or lower(c2.name) like '%day' or lower(c2.name) like '%created' or lower(c2.name) like '%loaded' or lower(c2.name) like '%event' or lower(c2.name) like '%posted' then 0 else 1 end), c2.column_id) as src_date_col,"
+            .. " (select top 1 c2.name from sys.columns c2 join sys.types ty on ty.user_type_id = c2.user_type_id where c2.object_id = t.object_id and c2.is_nullable = 0 and ty.name in ('tinyint','smallint','int','bigint','decimal','numeric','float','real','money','smallmoney') order by c2.column_id) as src_num_col,"
+            .. " cast(case when exists(select 1 from sys.partitions p where p.object_id = t.object_id and p.partition_number > 1) then 1 else 0 end as bit) as src_partitioned,"
+            .. " cast(NULL as varchar(8000)) as src_partitions"
+            .. " from sys.tables t join sys.schemas s on s.schema_id = t.schema_id where (<PREDICATE>)",
+        pair = "(s.name = '%s' and t.name = '%s')",
+    },
+    SNOWFLAKE = {
+        mode = 'sql',
+        template = "select t.table_schema, t.table_name, t.row_count,"
+            .. " (select kcu.column_name from information_schema.table_constraints tc join information_schema.key_column_usage kcu on kcu.constraint_name = tc.constraint_name and kcu.table_schema = tc.table_schema and kcu.table_name = tc.table_name join information_schema.columns col on col.table_schema = kcu.table_schema and col.table_name = kcu.table_name and col.column_name = kcu.column_name where tc.constraint_type = 'PRIMARY KEY' and tc.table_schema = t.table_schema and tc.table_name = t.table_name and col.data_type in ('NUMBER','DECIMAL','FLOAT','REAL','DOUBLE','INTEGER','BIGINT','SMALLINT','TINYINT','BYTEINT') and (select count(*) from information_schema.key_column_usage k2 where k2.constraint_name = tc.constraint_name and k2.table_schema = tc.table_schema and k2.table_name = tc.table_name) = 1 limit 1) as src_pk_col,"
+            .. " (select col.data_type from information_schema.columns col where col.table_schema = t.table_schema and col.table_name = t.table_name and col.column_name = (select kcu.column_name from information_schema.table_constraints tc join information_schema.key_column_usage kcu on kcu.constraint_name = tc.constraint_name and kcu.table_schema = tc.table_schema and kcu.table_name = tc.table_name where tc.constraint_type = 'PRIMARY KEY' and tc.table_schema = t.table_schema and tc.table_name = t.table_name limit 1) limit 1) as src_pk_type,"
+            .. " NULL, NULL,"
+            .. " NULL, NULL, NULL, NULL,"
+            .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and data_type in ('DATE','TIMESTAMP','TIMESTAMP_LTZ','TIMESTAMP_NTZ','TIMESTAMP_TZ','DATETIME','TIME') order by (case when lower(column_name) regexp '(date|dt|time|day|created|loaded|event|posted)$' then 0 else 1 end), ordinal_position limit 1) as src_date_col,"
+            .. " (select column_name from information_schema.columns where table_schema = t.table_schema and table_name = t.table_name and is_nullable = 'NO' and data_type in ('NUMBER','DECIMAL','FLOAT','REAL','DOUBLE','INTEGER','BIGINT','SMALLINT','TINYINT','BYTEINT') order by ordinal_position limit 1) as src_num_col,"
+            .. " FALSE as src_partitioned,"
+            .. " NULL"
+            .. " from information_schema.tables t where (<PREDICATE>)",
+        pair = "(t.table_schema = '%s' and t.table_name = '%s')",
+    },
+    BIGQUERY = {
+        kind = 'per_dataset',
+        build_sql = function(dataset, table_filters, project_id)
+            return build_bigquery_metadata_sql(dataset, table_filters, project_id)
+        end,
+    },
+    REDSHIFT = {
+        mode = 'sql',
+        template = [[select "schema", "table", tbl_rows, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from svv_table_info where (<PREDICATE>)]],
+        pair = [[("schema" = '%s' and "table" = '%s')]],
+    },
+    VERTICA = {
+        mode = 'sql',
+        template = "select projection_schema, anchor_table_name, row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(8000)) /* src_partitions */ from projection_storage where (<PREDICATE>)",
+        pair = "(projection_schema = '%s' and anchor_table_name = '%s')",
+    },
+    DB2 = {
+        mode = 'sql',
+        template = "select tabschema, tabname, card, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from syscat.tables where (<PREDICATE>)",
+        pair = "(tabschema = '%s' and tabname = '%s')",
+    },
+    HANA = {
+        mode = 'sql',
+        template = "select schema_name, table_name, record_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from sys.m_tables where (<PREDICATE>)",
+        pair = "(schema_name = '%s' and table_name = '%s')",
+    },
+    NETEZZA = {
+        mode = 'sql',
+        template = [[select schema, tablename, reltuples, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from _v_table where (<PREDICATE>)]],
+        pair = [[(schema = '%s' and tablename = '%s')]],
+    },
+    TERADATA = {
+        mode = 'sql',
+        template = "select databasename, tablename, currentpermspace, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL from dbc.tablesizev where (<PREDICATE>)",
+        pair = "(databasename = '%s' and tablename = '%s')",
+    },
+    DATABRICKS = {
+        mode = 'sql',
+        template = "select table_schema, table_name, cast(null as bigint) as row_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, cast(NULL as boolean) /* src_partitioned */, cast(NULL as varchar(8000)) /* src_partitions */ from information_schema.tables where (<PREDICATE>)",
+        pair = "(table_schema = '%s' and table_name = '%s')",
+    },
+}
+SOURCE_METADATA_BY_SOURCE.MARIADB = SOURCE_METADATA_BY_SOURCE.MYSQL
+SOURCE_METADATA_BY_SOURCE.AZURE_SQL = SOURCE_METADATA_BY_SOURCE.SQLSERVER
+
+-- Per-source SQL-dialect building blocks consumed by transform_for_split.
+-- Each entry exposes pushdown-friendly fragments for date bucketing, hash
+-- bucketing, and (where supported) ROWID-range bucketing. Sources missing an
+-- entry fall through to SINGLE in the split hierarchy.
+DIALECT_BY_SOURCE = {
+    POSTGRES = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'EXTRACT(MONTH FROM "' .. col .. '")' end,
+        day_fn = function(col) return 'EXTRACT(DAY FROM "' .. col .. '")' end,
+        year_month_fn = function(col) return '(EXTRACT(YEAR FROM "' .. col .. '") * 12 + EXTRACT(MONTH FROM "' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(ABS(HASHTEXT("' .. col .. '"::text)), ' .. n .. ') = ' .. k end,
+        rowid_supported = true,
+        rowid_expr = 'ctid',
+        rowid_where = function(n, k) return 'MOD(ABS(HASHTEXT(ctid::text)), ' .. n .. ') = ' .. k end,
+        partition_predicate = function(p) return p.predicate end,
+    },
+    SQLSERVER = {
+        -- T-SQL has no MOD() function; the modulo operator is `%`.
+        pk_where = function(col, n, k) return '("' .. col .. '" % ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '[' .. col .. '] BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH("' .. col .. '")' end,
+        day_fn = function(col) return 'DAY("' .. col .. '")' end,
+        year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
+        hash_where = function(col, n, k) return '(ABS(CHECKSUM("' .. col .. '")) % ' .. n .. ') = ' .. k end,
+        rowid_supported = true,
+        rowid_expr = '%%physloc%%',
+        rowid_where = function(n, k) return '(ABS(CHECKSUM(%%physloc%%)) % ' .. n .. ') = ' .. k end,
+        partition_predicate = function(p) return p.predicate end,
+    },
+    MYSQL = {
+        -- MySQL's default sql_mode rejects double-quoted identifiers (treats
+        -- them as string literals). Adapters consistently emit backticks for
+        -- source-side identifiers, so the WHERE we AND in must match.
+        pk_where = function(col, n, k) return '(`' .. col .. '` MOD ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '`' .. col .. '` BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH(`' .. col .. '`)' end,
+        day_fn = function(col) return 'DAY(`' .. col .. '`)' end,
+        year_month_fn = function(col) return '(YEAR(`' .. col .. '`) * 12 + MONTH(`' .. col .. '`))' end,
+        hash_where = function(col, n, k) return '(CONV(SUBSTRING(MD5(CAST(`' .. col .. '` AS CHAR)), 1, 8), 16, 10) MOD ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+    SNOWFLAKE = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH("' .. col .. '")' end,
+        day_fn = function(col) return 'DAY("' .. col .. '")' end,
+        year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
+        hash_where = function(col, n, k) return '(ABS(HASH("' .. col .. '")) % ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+    ORACLE = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'EXTRACT(MONTH FROM "' .. col .. '")' end,
+        day_fn = function(col) return 'EXTRACT(DAY FROM "' .. col .. '")' end,
+        year_month_fn = function(col) return '(EXTRACT(YEAR FROM "' .. col .. '") * 12 + EXTRACT(MONTH FROM "' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(ORA_HASH("' .. col .. '"), ' .. n .. ') = ' .. k end,
+        rowid_supported = true,
+        rowid_expr = 'ROWID',
+        rowid_where = function(n, k) return 'MOD(ORA_HASH(ROWID), ' .. n .. ') = ' .. k end,
+        partition_predicate = function(p) return p.predicate end,
+    },
+    DB2 = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH("' .. col .. '")' end,
+        day_fn = function(col) return 'DAY("' .. col .. '")' end,
+        year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(HASH4("' .. col .. '"), ' .. n .. ') = ' .. k end,
+        rowid_supported = true,
+        rowid_expr = 'RID_BIT(t)',
+        rowid_where = function(n, k) return 'MOD(HASH4(RID_BIT(t)), ' .. n .. ') = ' .. k end,
+    },
+    VERTICA = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH("' .. col .. '")' end,
+        day_fn = function(col) return 'DAY("' .. col .. '")' end,
+        year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(HASH("' .. col .. '"), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+        partition_predicate = function(p) return p.predicate end,
+    },
+    HANA = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH("' .. col .. '")' end,
+        day_fn = function(col) return 'DAYOFMONTH("' .. col .. '")' end,
+        year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(HASH_SHA256("' .. col .. '"), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+    REDSHIFT = {
+        -- Redshift inherits Postgres modulo semantics.
+        pk_where = function(col, n, k) return '("' .. col .. '" % ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'EXTRACT(MONTH FROM "' .. col .. '")' end,
+        day_fn = function(col) return 'EXTRACT(DAY FROM "' .. col .. '")' end,
+        year_month_fn = function(col) return '(EXTRACT(YEAR FROM "' .. col .. '") * 12 + EXTRACT(MONTH FROM "' .. col .. '"))' end,
+        hash_where = function(col, n, k) return '(STRTOL(SUBSTRING(MD5("' .. col .. '"::varchar), 1, 8), 16) % ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+    DATABRICKS = {
+        pk_where = function(col, n, k) return 'PMOD(`' .. col .. '`, ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '`' .. col .. '` BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH(`' .. col .. '`)' end,
+        day_fn = function(col) return 'DAY(`' .. col .. '`)' end,
+        year_month_fn = function(col) return '(YEAR(`' .. col .. '`) * 12 + MONTH(`' .. col .. '`))' end,
+        hash_where = function(col, n, k) return 'PMOD(HASH(`' .. col .. '`), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+        partition_predicate = function(p) return p.predicate end,
+    },
+    BIGQUERY = {
+        pk_where = function(col, n, k) return 'MOD(`' .. col .. '`, ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '`' .. col .. '` BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'EXTRACT(MONTH FROM `' .. col .. '`)' end,
+        day_fn = function(col) return 'EXTRACT(DAY FROM `' .. col .. '`)' end,
+        year_month_fn = function(col) return '(EXTRACT(YEAR FROM `' .. col .. '`) * 12 + EXTRACT(MONTH FROM `' .. col .. '`))' end,
+        hash_where = function(col, n, k) return 'MOD(ABS(FARM_FINGERPRINT(CAST(`' .. col .. '` AS STRING))), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+        partition_predicate = function(p) return p.predicate end,
+    },
+    NETEZZA = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'MONTH("' .. col .. '")' end,
+        day_fn = function(col) return 'DAY("' .. col .. '")' end,
+        year_month_fn = function(col) return '(YEAR("' .. col .. '") * 12 + MONTH("' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(HASH("' .. col .. '"), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+    TERADATA = {
+        pk_where = function(col, n, k) return 'MOD("' .. col .. '", ' .. n .. ') = ' .. k end,
+        pk_between = function(col, lo, hi) return '"' .. col .. '" BETWEEN ' .. lo .. ' AND ' .. hi end,
+        month_fn = function(col) return 'EXTRACT(MONTH FROM "' .. col .. '")' end,
+        day_fn = function(col) return 'EXTRACT(DAY FROM "' .. col .. '")' end,
+        year_month_fn = function(col) return '(EXTRACT(YEAR FROM "' .. col .. '") * 12 + EXTRACT(MONTH FROM "' .. col .. '"))' end,
+        hash_where = function(col, n, k) return 'MOD(HASHROW("' .. col .. '"), ' .. n .. ') = ' .. k end,
+        rowid_supported = false,
+    },
+}
+DIALECT_BY_SOURCE.MARIADB = DIALECT_BY_SOURCE.MYSQL
+DIALECT_BY_SOURCE.AZURE_SQL = DIALECT_BY_SOURCE.SQLSERVER
+
+function count_statement_clauses(sql)
+    if sql == nil then return 0 end
+    local n = 0
+    for _ in string.gmatch(sql, "[Ss][Tt][Aa][Tt][Ee][Mm][Ee][Nn][Tt]%s+'") do
+        n = n + 1
+    end
+    return n
+end
+
+-- Splits multi-statement IMPORT string into individual statements.
+-- Naive split on '; ' — assumes all STATEMENT clauses end with '; '.
+function split_multi_statement_import(sql)
+    if sql == nil or sql == '' then return {} end
+    local stmts = {}
+    for stmt in (sql .. '; '):gmatch('(.-);%s*') do
+        stmt = stmt:gsub('^%s+', ''):gsub('%s+$', '')
+        if stmt ~= '' then
+            stmts[#stmts + 1] = stmt
+        end
+    end
+    return stmts
+end
+
+function extract_source_ref_from_import(sql)
+    if sql == nil then return nil, nil end
+    -- Postgres / Oracle / MySQL / Snowflake adapters quote source identifiers
+    -- with double quotes. Match those first.
+    local schema, table_name = sql:match('[Ff][Rr][Oo][Mm]%s+"([^"]+)"%."([^"]+)"')
+    if schema and table_name then return schema, table_name end
+    -- SQL Server / Azure SQL adapter uses [bracket] quoting and may emit a
+    -- three-part name `[db].[schema].[table]`. Reduce to (schema, table).
+    local db, sch, tab = sql:match('[Ff][Rr][Oo][Mm]%s+%[([^%]]+)%]%.%[([^%]]+)%]%.%[([^%]]+)%]')
+    if db and sch and tab then return sch, tab end
+    schema, table_name = sql:match('[Ff][Rr][Oo][Mm]%s+%[([^%]]+)%]%.%[([^%]]+)%]')
+    if schema and table_name then return schema, table_name end
+    -- Databricks adapter uses backticks (`db`.`schema`.`table` or `schema`.`table`).
+    local db_b, sch_b, tab_b = sql:match('[Ff][Rr][Oo][Mm]%s+`([^`]+)`%.`([^`]+)`%.`([^`]+)`')
+    if db_b and sch_b and tab_b then return sch_b, tab_b end
+    schema, table_name = sql:match('[Ff][Rr][Oo][Mm]%s+`([^`]+)`%.`([^`]+)`')
+    if schema and table_name then return schema, table_name end
+    -- MySQL adapter emits unquoted `from <db>.<table>` (case-insensitive by default).
+    -- This branch runs last so quoted variants always win when present.
+    schema, table_name = sql:match('[Ff][Rr][Oo][Mm]%s+([%w_]+)%.([%w_]+)')
+    if schema and table_name then return schema, table_name end
+    return nil, nil
+end
+
+function rewrite_to_first_statement(sql)
+    if sql == nil then return sql end
+    local stmt_kw_start = string.find(sql:lower(), "statement%s+'")
+    if not stmt_kw_start then return sql end
+    local quote_open = sql:find("'", stmt_kw_start)
+    if not quote_open then return sql end
+    local i = quote_open + 1
+    while i <= #sql do
+        local c = sql:sub(i, i)
+        if c == "'" then
+            if sql:sub(i + 1, i + 1) == "'" then
+                i = i + 2
+            else
+                return sql:sub(1, i)
+            end
+        else
+            i = i + 1
+        end
+    end
+    return sql
+end
+
+function replace_row_sql(row, new_sql)
+    return { SQL_TEXT = new_sql, [1] = new_sql }
+end
+
+function parse_threshold(options)
+    local raw = opt(options, 'PARALLEL_ROW_THRESHOLD', '1000000')
+    local n = tonumber(raw)
+    if n == nil then
+        error('Invalid numeric option PARALLEL_ROW_THRESHOLD: ' .. tostring(raw))
+    end
+    return n
+end
+
+-- Collects unique source (schema, table) pairs the metadata round-trip needs.
+-- Multi-statement IMPORTs are needed by the gate (Speq 1) for threshold-collapse.
+-- Single-statement IMPORTs are needed by the splitter (Speq 2) for expansion.
+-- A single round-trip serves both consumers; the cache is keyed on source ident.
+-- Skipped entirely when threshold = 0 AND splitter is OFF AND PARALLEL_STATEMENTS = 1.
+function collect_metadata_pairs(res, options)
+    local pair_list = {}
+    local pairs_seen = {}
+    if res == nil then return pair_list end
+
+    local threshold = parse_threshold(options)
+    local splitter_active = splitter_potentially_active(options)
+    local ps_explicit = blank_to_nil(opt(options, 'PARALLEL_STATEMENTS', nil)) ~= nil
+
+    if threshold <= 0 and not (splitter_active and ps_explicit) then return pair_list end
+
+    for i = 1, #res do
+        local sql_text = first_sql_text(res[i])
+        if classify_step(sql_text) == 'IMPORT' then
+            local clauses = count_statement_clauses(sql_text)
+            local relevant = false
+            if clauses > 1 and threshold > 0 then
+                relevant = true
+            elseif clauses == 1 and splitter_active then
+                relevant = true
+            end
+            if relevant then
+                -- For multi-statement IMPORTs, extract pairs from each statement individually.
+                if clauses > 1 then
+                    local stmts = split_multi_statement_import(sql_text)
+                    for _, stmt in ipairs(stmts) do
+                        if classify_step(stmt) == 'IMPORT' then
+                            local src_schema, src_table = extract_source_ref_from_import(stmt)
+                            if src_schema ~= nil and src_table ~= nil then
+                                local key = src_schema .. '\t' .. src_table
+                                if not pairs_seen[key] then
+                                    pairs_seen[key] = true
+                                    pair_list[#pair_list + 1] = { schema = src_schema, table_name = src_table }
+                                end
+                            end
+                        end
+                    end
+                else
+                    -- Single-statement IMPORT: extract pair as before.
+                    local src_schema, src_table = extract_source_ref_from_import(sql_text)
+                    if src_schema ~= nil and src_table ~= nil then
+                        local key = src_schema .. '\t' .. src_table
+                        if not pairs_seen[key] then
+                            pairs_seen[key] = true
+                            pair_list[#pair_list + 1] = { schema = src_schema, table_name = src_table }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return pair_list
+end
+
+-- Groups (schema, table) pairs by schema (dataset). Returns { dataset = {pairs} }.
+function group_imports_by_dataset(pair_list)
+    local by_dataset = {}
+    if pair_list == nil then return by_dataset end
+    for _, pair in ipairs(pair_list) do
+        local dataset = pair.schema
+        if by_dataset[dataset] == nil then
+            by_dataset[dataset] = {}
+        end
+        by_dataset[dataset][#by_dataset[dataset] + 1] = pair
+    end
+    return by_dataset
+end
+
+-- Returns sorted list of dataset names for lexicographic iteration.
+function sorted_dataset_names(by_dataset)
+    local names = {}
+    for dataset, _ in pairs(by_dataset) do
+        names[#names + 1] = dataset
+    end
+    table.sort(names)
+    return names
+end
+
+-- Builds the BigQuery per-dataset metadata SQL. Returns a fully-qualified BQ SQL string
+-- against `<project>.<dataset>.INFORMATION_SCHEMA` tables.
+-- dataset: the BigQuery dataset name
+-- table_filters: list of {schema, table_name} pairs in this dataset
+-- project_id: extracted from connection or OPTIONS
+function build_bigquery_metadata_sql(dataset, table_filters, project_id)
+    local table_names = {}
+    for _, pair in ipairs(table_filters) do
+        table_names[#table_names + 1] = "'" .. escape_sql_literal(pair.table_name) .. "'"
+    end
+    local where_clause = "WHERE table_name IN (" .. table.concat(table_names, ",") .. ")"
+
+    -- BigQuery 15-column metadata shape (matching cache structure):
+    -- src_schema, src_table, src_rows, src_pk_col, src_pk_type,
+    -- src_pk_min, src_pk_max, src_unique_num_col, src_unique_num_type,
+    -- src_unique_num_min, src_unique_num_max, src_date_col, src_num_col, src_partitioned, src_partitions
+    local sql = "SELECT "
+        .. "'" .. escape_sql_literal(dataset) .. "' as src_schema, "
+        .. "table_name as src_table, "
+        .. "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL "
+        .. "FROM `" .. project_id .. "`.`" .. dataset .. "`.INFORMATION_SCHEMA.TABLES "
+        .. where_clause
+
+    return sql
+end
+
+-- Returns a metadata cache describing every source table referenced by IMPORTs in `res`.
+-- Shape:
+--   { available = bool, rows = { ["schema\ttable"] = {src_rows, src_pk_col, ...} },
+--     info_rows = { "-- ..." } }
+-- `available = false` means downstream consumers MUST pass IMPORTs through unchanged
+-- (Speq 2's soft-fail invariant for the splitter; matches Speq 1's gate behavior for
+-- lookup failure / unsupported source type).
+-- Helper to nullify BQ import results.
+local function nullify(v)
+    if is_null(v) then return nil end
+    return v
+end
+
+-- Helper to populate cache rows from JDBC result set.
+local function populate_cache_from_result(lookup_res)
+    local rows = {}
+    if lookup_res == nil then return rows end
+    for i = 1, #lookup_res do
+        local r = lookup_res[i]
+        local s = nullify(r.SRC_SCHEMA or r[1])
+        local t = nullify(r.SRC_TABLE or r[2])
+        if s ~= nil and t ~= nil then
+            rows[tostring(s) .. '\t' .. tostring(t)] = {
+                src_rows = nullify(r.SRC_ROWS or r[3]),
+                src_pk_col = nullify(r.SRC_PK_COL or r[4]),
+                src_pk_type = nullify(r.SRC_PK_TYPE or r[5]),
+                src_pk_min = nullify(r.SRC_PK_MIN or r[6]),
+                src_pk_max = nullify(r.SRC_PK_MAX or r[7]),
+                src_unique_num_col = nullify(r.SRC_UNIQUE_NUM_COL or r[8]),
+                src_unique_num_type = nullify(r.SRC_UNIQUE_NUM_TYPE or r[9]),
+                src_unique_num_min = nullify(r.SRC_UNIQUE_NUM_MIN or r[10]),
+                src_unique_num_max = nullify(r.SRC_UNIQUE_NUM_MAX or r[11]),
+                src_date_col = nullify(r.SRC_DATE_COL or r[12]),
+                src_num_col = nullify(r.SRC_NUM_COL or r[13]),
+                src_partitioned = nullify(r.SRC_PARTITIONED or r[14]),
+                src_partitions = nullify(r.SRC_PARTITIONS or r[15]),
+            }
+        end
+    end
+    return rows
+end
+
+-- Builds dialect-specific identifier quoting for min/max round-trip.
+function quote_identifier(source_type, identifier)
+    if source_type == 'POSTGRES' then
+        return '"' .. tostring(identifier):gsub('"', '""') .. '"'
+    elseif source_type == 'MYSQL' or source_type == 'MARIADB' then
+        return '`' .. tostring(identifier):gsub('`', '``') .. '`'
+    elseif source_type == 'SQLSERVER' or source_type == 'AZURE_SQL' then
+        return '[' .. tostring(identifier):gsub(']', ']]') .. ']'
+    end
+    -- Fallback for unknown sources (should not occur for Tier-0)
+    return tostring(identifier)
+end
+
+-- Builds the min/max UNION ALL query for Tier-0 sources.
+-- Input: list of {schema, table, pk_col} tuples that have numeric PKs
+-- Output: UNION ALL'd min/max SELECT statements
+function build_minmax_sql(source_type, minmax_tuples)
+    if minmax_tuples == nil or #minmax_tuples == 0 then
+        return nil
+    end
+
+    local branches = {}
+    for _, tuple in ipairs(minmax_tuples) do
+        local schema_quoted = quote_identifier(source_type, tuple.schema)
+        local table_quoted = quote_identifier(source_type, tuple.table)
+        local pk_quoted = quote_identifier(source_type, tuple.pk_col)
+
+        local branch = string.format("SELECT %s AS src_schema, %s AS src_table, MIN(%s) AS src_pk_min, MAX(%s) AS src_pk_max FROM %s.%s",
+            sql_string(tuple.schema),
+            sql_string(tuple.table),
+            pk_quoted,
+            pk_quoted,
+            schema_quoted,
+            table_quoted)
+
+        branches[#branches + 1] = branch
+    end
+
+    if #branches == 0 then
+        return nil
+    end
+
+    return table.concat(branches, '\nUNION ALL\n')
+end
+
+-- Collects (schema, table, pk_col) tuples from first-pass result that need min/max.
+function collect_minmax_tuples(first_pass_rows)
+    local tuples = {}
+    for _, row in ipairs(first_pass_rows) do
+        local schema = nullify(row.SRC_SCHEMA or row[1])
+        local table_name = nullify(row.SRC_TABLE or row[2])
+        local pk_col = nullify(row.SRC_PK_COL or row[4])
+        local pk_type = nullify(row.SRC_PK_TYPE or row[5])
+
+        -- Only include if we have a numeric PK
+        if schema ~= nil and table_name ~= nil and pk_col ~= nil and is_numeric_pk_type(pk_type) then
+            tuples[#tuples + 1] = {
+                schema = schema,
+                table = table_name,
+                pk_col = pk_col,
+            }
+        end
+    end
+    return tuples
+end
+
+-- Merges min/max results into existing cache rows via LEFT JOIN semantics.
+function merge_minmax_into_cache(cache_rows, minmax_rows, source_type)
+    local minmax_index = {}
+
+    -- Build index of min/max results keyed on (schema, table)
+    for _, row in ipairs(minmax_rows) do
+        local schema = nullify(row.SRC_SCHEMA or row[1])
+        local table_name = nullify(row.SRC_TABLE or row[2])
+        local pk_min = nullify(row.SRC_PK_MIN or row[3])
+        local pk_max = nullify(row.SRC_PK_MAX or row[4])
+
+        if schema ~= nil and table_name ~= nil then
+            local key = schema .. '\t' .. table_name
+            minmax_index[key] = {
+                src_pk_min = pk_min,
+                src_pk_max = pk_max,
+            }
+        end
+    end
+
+    -- LEFT JOIN: update cache rows where match found, leave NULL where no match
+    for key, cache_row in pairs(cache_rows) do
+        local minmax = minmax_index[key]
+        if minmax ~= nil then
+            cache_row.src_pk_min = minmax.src_pk_min
+            cache_row.src_pk_max = minmax.src_pk_max
+        end
+    end
+end
+
+function transform_for_metadata(res, source_type, connection_name, options, state)
+    local empty = { available = false, rows = {}, info_rows = {} }
+    if res == nil or #res == 0 then return empty end
+
+    local pair_list = collect_metadata_pairs(res, options)
+    if #pair_list == 0 then return empty end
+
+    local dispatch = SOURCE_METADATA_BY_SOURCE[source_type]
+    if dispatch == nil or dispatch.mode == 'skip_with_info' then
+        local reason
+        if dispatch == nil then
+            reason = 'no row-count SQL configured for source type ' .. tostring(source_type)
+        else
+            reason = dispatch.reason or 'metadata skipped'
+        end
+        local info_rows = {}
+        append_info_row(info_rows, '-- PARALLEL_ROW_THRESHOLD gate skipped: ' .. reason, state)
+        return {
+            available = false,
+            rows = {},
+            info_rows = info_rows,
+        }
+    end
+
+    -- Branch on dispatch kind: per_dataset vs. shared (default).
+    if dispatch and type(dispatch) == 'table' and dispatch.kind == 'per_dataset' then
+        local by_dataset = group_imports_by_dataset(pair_list)
+        local merged_rows = {}
+        local info_rows = {}
+        local dataset_names = sorted_dataset_names(by_dataset)
+        local project_id = blank_to_nil(opt(options, 'PROJECT_ID', nil))
+
+        for _, dataset in ipairs(dataset_names) do
+            local table_pairs = by_dataset[dataset]
+            local sql = dispatch.build_sql(dataset, table_pairs, project_id)
+
+            local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_pk_min decimal(36,0), src_pk_max decimal(36,0), src_unique_num_col varchar(2000), src_unique_num_type varchar(200), src_unique_num_min decimal(36,0), src_unique_num_max decimal(36,0), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean, src_partitions varchar(2000000)) from jdbc at "
+                .. connection_name
+                .. " statement '"
+                .. escape_sql_literal(sql)
+                .. "')"
+
+            local success, lookup_res = pquery(outer_sql)
+            if not success then
+                -- Per-dataset failure: emit INFO row with error, populate NULL rows for this dataset's tables.
+                local err_msg = (lookup_res and lookup_res.error_message) or 'unknown error'
+                append_info_row(info_rows, '-- PARALLEL_ROW_THRESHOLD gate: BigQuery metadata lookup failed for dataset ' .. dataset .. ': ' .. err_msg, state)
+                for _, pair in ipairs(table_pairs) do
+                    local key = pair.schema .. '\t' .. pair.table_name
+                    merged_rows[key] = {
+                        src_rows = nil, src_pk_col = nil, src_pk_type = nil,
+                        src_pk_min = nil, src_pk_max = nil,
+                        src_unique_num_col = nil, src_unique_num_type = nil,
+                        src_unique_num_min = nil, src_unique_num_max = nil,
+                        src_date_col = nil, src_num_col = nil,
+                        src_partitioned = nil, src_partitions = nil,
+                    }
+                end
+            else
+                local cache = populate_cache_from_result(lookup_res)
+                for key, row_data in pairs(cache) do
+                    merged_rows[key] = row_data
+                end
+            end
+        end
+
+        return { available = true, rows = merged_rows, info_rows = info_rows }
+    end
+
+    -- Shared (default) path: one or two round-trips per migration.
+    local pair_clauses = {}
+    for _, p in ipairs(pair_list) do
+        pair_clauses[#pair_clauses + 1] = string.format(dispatch.pair,
+            escape_sql_literal(p.schema), escape_sql_literal(p.table_name))
+    end
+    local predicate = table.concat(pair_clauses, ' or ')
+    local metadata_sql = (dispatch.template:gsub('<PREDICATE>', function() return predicate end))
+
+    local outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_rows decimal(36,0), src_pk_col varchar(2000), src_pk_type varchar(200), src_pk_min decimal(36,0), src_pk_max decimal(36,0), src_unique_num_col varchar(2000), src_unique_num_type varchar(200), src_unique_num_min decimal(36,0), src_unique_num_max decimal(36,0), src_date_col varchar(2000), src_num_col varchar(2000), src_partitioned boolean, src_partitions varchar(2000000)) from jdbc at "
+        .. connection_name
+        .. " statement '"
+        .. escape_sql_literal(metadata_sql)
+        .. "')"
+
+    local success, lookup_res = pquery(outer_sql)
+    if not success then
+        local err = (lookup_res and lookup_res.error_message) or 'unknown error'
+        local info_rows = {}
+        append_info_row(info_rows, '-- PARALLEL_ROW_THRESHOLD gate skipped: row-count lookup failed (' .. tostring(err) .. ')', state)
+        return {
+            available = false,
+            rows = {},
+            info_rows = info_rows,
+        }
+    end
+
+    local rows = populate_cache_from_result(lookup_res)
+    local info_rows = {}
+
+    -- Second-pass min/max round-trip for Tier-0 sources when needed.
+    if dispatch.needs_min_max_pass then
+        -- Check if gate + splitter are both disabled; if so, skip second-pass.
+        local threshold = parse_threshold(options)
+        local splitter_active = splitter_potentially_active(options)
+
+        local should_skip_minmax = (threshold <= 0 and not splitter_active)
+
+        if not should_skip_minmax then
+            -- Collect (schema, table, pk_col) tuples from first-pass that need min/max
+            local minmax_tuples = collect_minmax_tuples(lookup_res)
+
+            if minmax_tuples and #minmax_tuples > 0 then
+                local minmax_sql = build_minmax_sql(source_type, minmax_tuples)
+                if minmax_sql ~= nil then
+                    local minmax_outer_sql = "select * from (import into (src_schema varchar(2000), src_table varchar(2000), src_pk_min decimal(36,0), src_pk_max decimal(36,0)) from jdbc at "
+                        .. connection_name
+                        .. " statement '"
+                        .. escape_sql_literal(minmax_sql)
+                        .. "')"
+
+                    -- Soft-fail: wrap in pcall to catch permission-denied, table-missing, etc.
+                    local minmax_pcall_ok, minmax_query_success, minmax_lookup_res = pcall(pquery, minmax_outer_sql)
+
+                        if minmax_pcall_ok then
+                            -- pcall succeeded, so minmax_query_success is the bool from pquery
+                            if minmax_query_success then
+                                -- LEFT JOIN min/max into cache rows
+                                merge_minmax_into_cache(rows, minmax_lookup_res, source_type)
+                            else
+                                -- Min/max query failed; emit INFO row for each table that had a numeric PK
+                                local err = (minmax_lookup_res and minmax_lookup_res.error_message) or 'unknown error'
+                                for _, tuple in ipairs(minmax_tuples) do
+                                    append_info_row(info_rows, '-- second-pass min/max round-trip failed for ' .. tuple.schema .. '.' .. tuple.table .. ': ' .. tostring(err), state)
+                                end
+                            end
+                        else
+                            -- pcall itself failed (should not happen in normal operation)
+                            local pcall_err = tostring(minmax_query_success)  -- second arg is error message
+                            for _, tuple in ipairs(minmax_tuples) do
+                                append_info_row(info_rows, '-- second-pass min/max round-trip error for ' .. tuple.schema .. '.' .. tuple.table .. ': ' .. pcall_err, state)
+                            end
+                        end
+                    end
+            end
+        end
+    end
+
+    return { available = true, rows = rows, info_rows = info_rows }
+end
+
+function raw_parallel_requested(options)
+    local raw = blank_to_nil(opt(options, 'PARALLEL_STATEMENTS', 'AUTO')) or 'AUTO'
+    local up = string.upper(raw)
+    if up == 'AUTO' then return 'AUTO' end
+    return tostring(raw)
+end
+
+-- Speq 1 gate: collapses multi-statement IMPORTs whose source row count is below
+-- `PARALLEL_ROW_THRESHOLD` to a single statement. Consumes the shared metadata cache
+-- populated by `transform_for_metadata`; never issues its own source-side query.
+-- Writes a decision record per multi-statement IMPORT row it touches so the
+-- audit transform can later populate SPLIT_STRATEGY / PARALLEL_EFFECTIVE.
+function transform_for_gate(res, options, cache, decisions, state)
+    if res == nil or #res == 0 then return res end
+    decisions = decisions or {}
+    state = state or {}
+
+    local threshold = parse_threshold(options)
+    local requested = raw_parallel_requested(options)
+
+    local out = {}
+    for j = 1, #res do out[j] = res[j] end
+
+    if cache ~= nil then
+        for _, info_text in ipairs(cache.info_rows) do
+            out[#out + 1] = { SQL_TEXT = info_text }
+        end
+    end
+
+    if threshold <= 0 then
+        return out
+    end
+    if cache == nil or not cache.available then
+        return out
+    end
+
+    for i = 1, #res do
+        local sql_text = first_sql_text(res[i])
+        if classify_step(sql_text) == 'IMPORT' then
+            local clause_count = count_statement_clauses(sql_text)
+            if clause_count > 1 then
+                local src_schema, src_table = extract_source_ref_from_import(sql_text)
+                if src_schema ~= nil and src_table ~= nil then
+                    local meta = cache.rows[src_schema .. '\t' .. src_table]
+                    local rowcount = meta and meta.src_rows
+                    local effective = tonumber(rowcount) or 0
+                    if effective < threshold then
+                        out[i] = replace_row_sql(out[i], rewrite_to_first_statement(sql_text))
+                        decisions[i] = { strategy = 'SINGLE', key = nil, requested = requested, effective = 1 }
+                    else
+                        decisions[i] = { strategy = 'MULTI_PASSTHROUGH', key = nil, requested = requested, effective = clause_count }
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+function parse_split_directive(options)
+    local raw = blank_to_nil(opt(options, 'PARALLEL_SPLIT', 'AUTO')) or 'AUTO'
+    local up = string.upper(raw)
+    if up == 'AUTO' then return { mode = 'AUTO' } end
+    if up == 'OFF' then return { mode = 'OFF' } end
+    if up == 'PK' then return { mode = 'PK' } end
+    if up == 'PARTITION' then return { mode = 'PARTITION' } end
+    if up == 'ROWID' then return { mode = 'ROWID' } end
+    if up == 'DATE' then return { mode = 'DATE' } end
+    if up == 'UNIQUE_NUM' then return { mode = 'UNIQUE_NUM' } end
+
+    local prefix, rest = raw:match('^([^:]+):(.+)$')
+    if prefix and string.upper(prefix) == 'DATE' then
+        local col, grain = rest:match('^([^:]+):(.+)$')
+        if col then return { mode = 'DATE', col = col, grain = string.upper(grain) } end
+        return { mode = 'DATE', col = rest }
+    end
+    if prefix and string.upper(prefix) == 'HASH' then
+        return { mode = 'HASH', col = rest }
+    end
+    if prefix and string.upper(prefix) == 'UNIQUE_NUM' then
+        return { mode = 'UNIQUE_NUM', col = rest }
+    end
+    error('Invalid PARALLEL_SPLIT value: ' .. tostring(raw))
+end
+
+function parse_auto_ceiling(options)
+    local raw = blank_to_nil(opt(options, 'PARALLEL_AUTO_CEILING', '12')) or '12'
+    local n = tonumber(raw)
+    if n == nil or n < 1 or math.floor(n) ~= n then
+        error('Invalid PARALLEL_AUTO_CEILING (must be positive integer): ' .. tostring(raw))
+    end
+    return math.floor(n)
+end
+
+-- Resolves PARALLEL_STATEMENTS to a per-table (effective_n, requested) pair.
+-- AUTO heuristic: min(ceiling, max(1, ceil(src_rows / 5_000_000))).
+-- AUTO with NULL or non-positive src_rows -> effective_n = 1 (gate-collapse semantics).
+-- Explicit positive integer bypasses the ceiling.
+-- Invalid values raise.
+function resolve_parallel_statements(options, src_rows)
+    local raw = blank_to_nil(opt(options, 'PARALLEL_STATEMENTS', 'AUTO')) or 'AUTO'
+    local up = string.upper(raw)
+    if up == 'AUTO' then
+        local rows = tonumber(src_rows)
+        if rows == nil or rows <= 0 then
+            return { effective = 1, requested = 'AUTO' }
+        end
+        local ceiling = parse_auto_ceiling(options)
+        local heuristic = math.ceil(rows / 5000000)
+        if heuristic < 1 then heuristic = 1 end
+        if heuristic > ceiling then heuristic = ceiling end
+        return { effective = heuristic, requested = 'AUTO' }
+    end
+    local n = tonumber(raw)
+    if n == nil or n < 1 or math.floor(n) ~= n then
+        error('Invalid PARALLEL_STATEMENTS (must be AUTO or positive integer): ' .. tostring(raw))
+    end
+    return { effective = math.floor(n), requested = tostring(math.floor(n)) }
+end
+
+-- Adapter-call helper: Oracle (and any future adapter that takes an integer
+-- PARALLEL_STATEMENTS) consumes its OPTIONS value directly. AUTO is a master-
+-- script concept; downstream adapters receive `default_n` instead. Invalid
+-- explicit values raise here so adapter SQL is never constructed.
+function resolve_parallel_statements_for_adapter(options, default_n)
+    local raw = blank_to_nil(opt(options, 'PARALLEL_STATEMENTS', nil))
+    if raw == nil then return tostring(default_n) end
+    if string.upper(raw) == 'AUTO' then return tostring(default_n) end
+    local n = tonumber(raw)
+    if n == nil or n < 1 or math.floor(n) ~= n then
+        error('Invalid PARALLEL_STATEMENTS (must be AUTO or positive integer): ' .. tostring(raw))
+    end
+    return tostring(math.floor(n))
+end
+
+-- Validates every PARALLEL_* OPTIONS key before any adapter SQL is constructed
+-- or any source-side query fires. Raises on invalid values per spec contract
+-- (parallel-auto-ceiling: "MUST NOT execute any adapter SQL nor any source-side
+-- query" on validation failure).
+function validate_parallel_options(options)
+    local ps_raw = blank_to_nil(opt(options, 'PARALLEL_STATEMENTS', nil))
+    if ps_raw ~= nil and string.upper(ps_raw) ~= 'AUTO' then
+        local n = tonumber(ps_raw)
+        if n == nil or n < 1 or math.floor(n) ~= n then
+            error('Invalid PARALLEL_STATEMENTS (must be AUTO or positive integer): ' .. tostring(ps_raw))
+        end
+    end
+    local ac_raw = blank_to_nil(opt(options, 'PARALLEL_AUTO_CEILING', nil))
+    if ac_raw ~= nil then
+        local n = tonumber(ac_raw)
+        if n == nil or n < 1 or math.floor(n) ~= n then
+            error('Invalid PARALLEL_AUTO_CEILING (must be positive integer): ' .. tostring(ac_raw))
+        end
+    end
+    parse_split_directive(options)
+end
+
+-- Returns true when the splitter MIGHT fire for at least one IMPORT in this
+-- migration; used by collect_metadata_pairs to decide whether to fetch metadata
+-- for single-statement IMPORTs.
+function splitter_potentially_active(options)
+    local split_raw = string.upper(blank_to_nil(opt(options, 'PARALLEL_SPLIT', 'AUTO')) or 'AUTO')
+    if split_raw == 'OFF' then return false end
+    local ps_raw = string.upper(blank_to_nil(opt(options, 'PARALLEL_STATEMENTS', 'AUTO')) or 'AUTO')
+    if ps_raw == 'AUTO' then return true end
+    local n = tonumber(ps_raw)
+    if n and n >= 2 then return true end
+    return false
+end
+
+function is_numeric_pk_type(type_str)
+    if type_str == nil then return false end
+    local up = string.upper(tostring(type_str))
+    if up == '' then return false end
+    if up:find('INT', 1, true) then return true end
+    if up:find('NUMERIC', 1, true) then return true end
+    if up:find('NUMBER', 1, true) then return true end
+    if up:find('DECIMAL', 1, true) then return true end
+    if up:find('FLOAT', 1, true) then return true end
+    if up:find('DOUBLE', 1, true) then return true end
+    if up:find('REAL', 1, true) then return true end
+    if up == 'SERIAL' or up == 'BIGSERIAL' or up == 'SMALLSERIAL' then return true end
+    return false
+end
+
+function parse_partitions(json_str)
+    if json_str == nil then return nil end
+
+    -- Minimal JSON array parser for partition objects
+    -- Expected format: [{"name":"<name>","predicate":"<predicate>"}, ...]
+    local result = {}
+    local i = 1
+    local n = #json_str
+
+    -- Skip whitespace and opening bracket
+    while i <= n and json_str:sub(i, i):match('[%s%[]') do i = i + 1 end
+    if i > n then return nil end
+
+    -- Parse objects until closing bracket
+    while i <= n do
+        -- Skip whitespace
+        while i <= n and json_str:sub(i, i):match('%s') do i = i + 1 end
+        if i > n then break end
+
+        local ch = json_str:sub(i, i)
+        if ch == ']' then break end
+        if ch ~= '{' then return nil end
+
+        i = i + 1
+        local obj = {}
+
+        -- Parse object fields
+        local field_count = 0
+        while i <= n do
+            -- Skip whitespace
+            while i <= n and json_str:sub(i, i):match('%s') do i = i + 1 end
+            if i > n then return nil end
+
+            ch = json_str:sub(i, i)
+            if ch == '}' then i = i + 1; break end
+            if ch == ',' then i = i + 1; field_count = 0 end
+            if field_count > 0 then return nil end
+
+            -- Parse field name
+            if json_str:sub(i, i) ~= '"' then return nil end
+            i = i + 1
+            local fname_start = i
+            while i <= n and json_str:sub(i, i) ~= '"' do
+                if json_str:sub(i, i) == '\\' then i = i + 2 else i = i + 1 end
+            end
+            if i > n then return nil end
+            local fname = json_str:sub(fname_start, i - 1)
+            i = i + 1
+
+            -- Skip whitespace and colon
+            while i <= n and json_str:sub(i, i):match('[%s:]') do i = i + 1 end
+            if i > n then return nil end
+
+            -- Parse field value (string only)
+            if json_str:sub(i, i) ~= '"' then return nil end
+            i = i + 1
+            local fval_start = i
+            while i <= n and json_str:sub(i, i) ~= '"' do
+                if json_str:sub(i, i) == '\\' then i = i + 2 else i = i + 1 end
+            end
+            if i > n then return nil end
+            local fval = json_str:sub(fval_start, i - 1)
+            i = i + 1
+
+            obj[fname] = fval
+            field_count = field_count + 1
+        end
+
+        if obj.name and obj.predicate then
+            result[#result + 1] = obj
+        end
+
+        -- Skip whitespace and comma
+        while i <= n and json_str:sub(i, i):match('[%s,]') do i = i + 1 end
+    end
+
+    if #result == 0 then return nil end
+    return result
+end
+
+function pick_split_strategy(meta, options, dialect, source_type)
+    local directive = parse_split_directive(options)
+    if directive.mode == 'OFF' then return nil, nil end
+
+    if directive.mode == 'AUTO' then
+        if meta == nil then return nil, 'metadata cache empty' end
+        -- PARTITION is first step in AUTO hierarchy
+        local partition_parse_failed = false
+        if meta.src_partitions and dialect and dialect.partition_predicate then
+            local partitions = parse_partitions(meta.src_partitions)
+            if partitions then
+                return { strategy = 'PARTITION', partitions = partitions }
+            else
+                -- JSON parse failed; continue to next strategy and emit INFO later
+                partition_parse_failed = true
+            end
+        end
+        if meta.src_pk_col and is_numeric_pk_type(meta.src_pk_type) then
+            local decision = { strategy = 'PK_RANGE', key = meta.src_pk_col }
+            if meta.src_pk_min ~= nil and meta.src_pk_max ~= nil then
+                decision.lo = meta.src_pk_min
+                decision.hi = meta.src_pk_max
+            end
+            -- If PARTITION parse failed, attach INFO message to this decision
+            if partition_parse_failed then
+                decision.soft_fail_info = 'partition cache string was unparseable'
+            end
+            return decision
+        end
+        if meta.src_unique_num_col and is_numeric_pk_type(meta.src_unique_num_type) then
+            local decision = { strategy = 'UNIQUE_NUM', key = meta.src_unique_num_col }
+            if meta.src_unique_num_min ~= nil and meta.src_unique_num_max ~= nil then
+                decision.lo = meta.src_unique_num_min
+                decision.hi = meta.src_unique_num_max
+            end
+            return decision
+        end
+        if meta.src_date_col then
+            return { strategy = 'DATE_BUCKET', key = meta.src_date_col }
+        end
+        if meta.src_num_col then
+            return { strategy = 'HASH_NUM', key = meta.src_num_col }
+        end
+        if dialect and dialect.rowid_supported then
+            return { strategy = 'ROWID', key = dialect.rowid_expr }
+        end
+        return nil, 'no usable split column for ' .. tostring(source_type)
+    end
+
+    if directive.mode == 'PK' then
+        if meta and meta.src_pk_col and is_numeric_pk_type(meta.src_pk_type) then
+            local decision = { strategy = 'PK_RANGE', key = meta.src_pk_col }
+            if meta.src_pk_min ~= nil and meta.src_pk_max ~= nil then
+                decision.lo = meta.src_pk_min
+                decision.hi = meta.src_pk_max
+            end
+            return decision
+        end
+        return nil, 'PARALLEL_SPLIT=PK requested but no numeric PK in metadata'
+    end
+
+    if directive.mode == 'DATE' then
+        local col = directive.col or (meta and meta.src_date_col)
+        if col == nil then return nil, 'PARALLEL_SPLIT=DATE but no date column known' end
+        return { strategy = 'DATE_BUCKET', key = col, grain = directive.grain }
+    end
+
+    if directive.mode == 'HASH' then
+        if directive.col == nil then return nil, 'PARALLEL_SPLIT=HASH requires a column name' end
+        return { strategy = 'HASH_NUM', key = directive.col }
+    end
+
+    if directive.mode == 'ROWID' then
+        if dialect and dialect.rowid_supported then
+            return { strategy = 'ROWID', key = dialect.rowid_expr }
+        end
+        return nil, 'PARALLEL_SPLIT=ROWID unsupported for ' .. tostring(source_type)
+    end
+
+    if directive.mode == 'UNIQUE_NUM' then
+        local col = directive.col or (meta and meta.src_unique_num_col)
+        if col == nil then
+            return nil, 'INFO: PARALLEL_SPLIT=UNIQUE_NUM requested but no unique-num col known and no override supplied'
+        end
+        local decision = { strategy = 'UNIQUE_NUM', key = col }
+        if meta and meta.src_unique_num_min ~= nil and meta.src_unique_num_max ~= nil then
+            decision.lo = meta.src_unique_num_min
+            decision.hi = meta.src_unique_num_max
+        end
+        return decision
+    end
+
+    if directive.mode == 'PARTITION' then
+        if meta == nil then return nil, 'metadata cache empty' end
+        local partitions = meta.src_partitions and parse_partitions(meta.src_partitions)
+        if partitions then
+            return { strategy = 'PARTITION', partitions = partitions }
+        end
+        -- Forced PARTITION on non-partitioned source: soft-fail to SINGLE with INFO
+        return { strategy = 'SINGLE', soft_fail = 'PARTITION requested but source not partitioned' }
+    end
+
+    return nil, 'unsupported PARALLEL_SPLIT mode ' .. tostring(directive.mode)
+end
+
+function build_date_bucket(col, grain, dialect, n, k)
+    if dialect == nil or dialect.month_fn == nil then return nil end
+
+    local resolved_grain = grain
+    if resolved_grain == nil then
+        if n == 2 then resolved_grain = 'HALF'
+        elseif n == 3 then resolved_grain = 'TRIMESTER'
+        elseif n == 4 then resolved_grain = 'QUARTER'
+        elseif n == 6 then resolved_grain = 'BIMONTH'
+        elseif n == 12 then resolved_grain = 'MONTH'
+        elseif n <= 31 then resolved_grain = 'DAY'
+        else resolved_grain = 'YEAR_MONTH' end
+    end
+
+    local clause
+    if resolved_grain == 'MONTH' then
+        if n == 12 then
+            clause = dialect.month_fn(col) .. ' = ' .. (k + 1)
+        else
+            local months = {}
+            local m = k + 1
+            while m <= 12 do months[#months + 1] = tostring(m); m = m + n end
+            clause = dialect.month_fn(col) .. ' IN (' .. table.concat(months, ', ') .. ')'
+        end
+    elseif resolved_grain == 'QUARTER' then
+        local m0 = k * 3 + 1
+        clause = dialect.month_fn(col) .. ' IN (' .. m0 .. ', ' .. (m0 + 1) .. ', ' .. (m0 + 2) .. ')'
+    elseif resolved_grain == 'HALF' then
+        if k == 0 then clause = dialect.month_fn(col) .. ' IN (1, 2, 3, 4, 5, 6)'
+        else clause = dialect.month_fn(col) .. ' IN (7, 8, 9, 10, 11, 12)' end
+    elseif resolved_grain == 'TRIMESTER' then
+        local m0 = k * 4 + 1
+        clause = dialect.month_fn(col) .. ' IN (' .. m0 .. ', ' .. (m0 + 1) .. ', ' .. (m0 + 2) .. ', ' .. (m0 + 3) .. ')'
+    elseif resolved_grain == 'BIMONTH' then
+        local m0 = k * 2 + 1
+        clause = dialect.month_fn(col) .. ' IN (' .. m0 .. ', ' .. (m0 + 1) .. ')'
+    elseif resolved_grain == 'DAY' then
+        if dialect.day_fn == nil then return nil end
+        if k == n - 1 and n < 31 then
+            local days = {}
+            for d = n + 1, 31 do days[#days + 1] = tostring(d) end
+            if #days == 0 then
+                clause = dialect.day_fn(col) .. ' = ' .. (k + 1)
+            else
+                clause = dialect.day_fn(col) .. ' IN (' .. (k + 1) .. ', ' .. table.concat(days, ', ') .. ')'
+            end
+        else
+            clause = dialect.day_fn(col) .. ' = ' .. (k + 1)
+        end
+    elseif resolved_grain == 'YEAR_MONTH' then
+        if dialect.year_month_fn == nil then return nil end
+        clause = 'MOD(' .. dialect.year_month_fn(col) .. ', ' .. n .. ') = ' .. k
+    else
+        return nil
+    end
+
+    if k == 0 then
+        clause = '(' .. clause .. ' OR "' .. col .. '" IS NULL)'
+    end
+    return clause
+end
+
+function build_where_for_split(decision, dialect, n, k)
+    if decision == nil then return nil end
+    if decision.strategy == 'PARTITION' then
+        if decision.partitions == nil or #decision.partitions == 0 then return nil end
+        -- Chunking: group partitions into n chunks, each chunk k covers slice*k to slice*(k+1)
+        local num_partitions = #decision.partitions
+        local num_chunks = math.min(n, num_partitions)
+        if k >= num_chunks then return nil end
+        -- If fewer partitions than n, emit exactly one partition per STATEMENT
+        local slice = math.ceil(num_partitions / num_chunks)
+        local start_idx = k * slice + 1
+        local end_idx = math.min((k + 1) * slice, num_partitions)
+        -- OR together the partition predicates in this chunk
+        local predicates = {}
+        for i = start_idx, end_idx do
+            predicates[#predicates + 1] = '(' .. decision.partitions[i].predicate .. ')'
+        end
+        return table.concat(predicates, ' OR ')
+    end
+    if decision.strategy == 'PK_RANGE' or decision.strategy == 'UNIQUE_NUM' then
+        -- BETWEEN path: when min/max are available and dialect supports pk_between.
+        if decision.lo ~= nil and decision.hi ~= nil and dialect and dialect.pk_between then
+            local width = math.ceil((decision.hi - decision.lo + 1) / n)
+            local lo_k = decision.lo + k * width
+            local hi_k = (k == n - 1) and decision.hi or (decision.lo + (k + 1) * width - 1)
+
+            -- Skip buckets that fall entirely beyond max.
+            if lo_k > decision.hi then return nil end
+
+            local clause = dialect.pk_between(decision.key, lo_k, hi_k)
+
+            -- First bucket must also capture NULL rows.
+            if k == 0 then
+                -- Extract quoting style from pk_between output to quote column name for IS NULL.
+                local between_output = dialect.pk_between(decision.key, 1, 1)
+                local quoted_col
+                if between_output:match('^"') then
+                    quoted_col = '"' .. decision.key .. '"'
+                elseif between_output:match('^`') then
+                    quoted_col = '`' .. decision.key .. '`'
+                elseif between_output:match('^%[') then
+                    quoted_col = '[' .. decision.key .. ']'
+                else
+                    quoted_col = '"' .. decision.key .. '"'
+                end
+                clause = '(' .. clause .. ' OR ' .. quoted_col .. ' IS NULL)'
+            end
+
+            return clause
+        end
+
+        -- MOD fallback: when min/max unavailable or dialect lacks pk_between.
+        if dialect and dialect.pk_where then
+            return dialect.pk_where(decision.key, n, k)
+        end
+        -- Conservative fallback for sources without a dialect entry.
+        return 'MOD("' .. decision.key .. '", ' .. n .. ') = ' .. k
+    end
+    if decision.strategy == 'DATE_BUCKET' then
+        return build_date_bucket(decision.key, decision.grain, dialect, n, k)
+    end
+    if decision.strategy == 'HASH_NUM' then
+        if dialect == nil or dialect.hash_where == nil then return nil end
+        return dialect.hash_where(decision.key, n, k)
+    end
+    if decision.strategy == 'ROWID' then
+        if dialect == nil or dialect.rowid_where == nil then return nil end
+        return dialect.rowid_where(n, k)
+    end
+    return nil
+end
+
+function append_where_to_inner_select(inner, where_clause)
+    local lower = inner:lower()
+    local where_pos = nil
+    local cut_pos = #inner + 1
+
+    local i = 1
+    local in_string = false
+    while i <= #inner do
+        local c = inner:sub(i, i)
+        if in_string then
+            if c == "'" then
+                if inner:sub(i + 1, i + 1) == "'" then i = i + 2
+                else in_string = false; i = i + 1 end
+            else i = i + 1 end
+        elseif c == "'" then
+            in_string = true; i = i + 1
+        else
+            local before_ok = (i == 1) or inner:sub(i - 1, i - 1):match('[%s%)]') ~= nil
+            if before_ok then
+                local six = lower:sub(i, i + 5)
+                if (six == 'where ' or six == 'where\t' or six == 'where\n') and where_pos == nil then
+                    where_pos = i
+                end
+                if six == 'group ' or six == 'order ' or six == 'having' then
+                    if i < cut_pos then cut_pos = i end
+                end
+                if lower:sub(i, i + 4) == 'limit' then
+                    local trail = inner:sub(i + 5, i + 5)
+                    if trail == '' or trail:match('[%s]') then
+                        if i < cut_pos then cut_pos = i end
+                    end
+                end
+            end
+            i = i + 1
+        end
+    end
+
+    local head = inner:sub(1, cut_pos - 1)
+    local tail = inner:sub(cut_pos)
+    local trimmed = head:gsub('%s+$', '')
+
+    if where_pos and where_pos < cut_pos then
+        if tail == '' then return trimmed .. ' AND (' .. where_clause .. ')' end
+        return trimmed .. ' AND (' .. where_clause .. ') ' .. tail
+    end
+    if tail == '' then return trimmed .. ' WHERE ' .. where_clause end
+    return trimmed .. ' WHERE ' .. where_clause .. ' ' .. tail
+end
+
+function rewrite_import_to_multi_stmt(sql, where_per_k, n)
+    local stmt_start = string.find(sql:lower(), "statement%s+'")
+    if not stmt_start then return nil end
+    local quote_open = sql:find("'", stmt_start)
+    if not quote_open then return nil end
+
+    local i = quote_open + 1
+    local inner_end = nil
+    while i <= #sql do
+        local c = sql:sub(i, i)
+        if c == "'" then
+            if sql:sub(i + 1, i + 1) == "'" then i = i + 2
+            else inner_end = i - 1; break end
+        else i = i + 1 end
+    end
+    if inner_end == nil then return nil end
+
+    local prefix = sql:sub(1, stmt_start - 1):gsub('%s+$', '')
+    local inner_escaped = sql:sub(quote_open + 1, inner_end)
+    local inner = inner_escaped:gsub("''", "'")
+
+    local out = prefix
+    for k = 0, n - 1 do
+        local where = where_per_k[k + 1]
+        if where == nil then return nil end
+        local modified = append_where_to_inner_select(inner, where)
+        local re_escaped = modified:gsub("'", "''")
+        out = out .. " STATEMENT '" .. re_escaped .. "'"
+    end
+    return out
+end
+
+-- Speq 2 splitter: expands single-statement IMPORTs at-or-above
+-- PARALLEL_ROW_THRESHOLD into N parallel STATEMENT clauses with pushdown-friendly
+-- WHERE selectors picked via the split-strategy hierarchy. Multi-statement
+-- IMPORTs are left untouched (the adapter already chose its split). Any failure
+-- inside the splitter logs an INFO row and leaves the IMPORT unchanged - the
+-- splitter is an optimization and MUST NOT break a migration.
+function transform_for_split(res, options, cache, source_type, decisions, state)
+    if res == nil or #res == 0 then return res end
+    decisions = decisions or {}
+    state = state or {}
+
+    local directive_ok, directive = pcall(parse_split_directive, options)
+    if not directive_ok then return res end
+    if directive.mode == 'OFF' then return res end
+    if cache == nil or not cache.available then return res end
+
+    local threshold = parse_threshold(options)
+    local dialect = DIALECT_BY_SOURCE[source_type]
+    local requested = raw_parallel_requested(options)
+
+    local out = {}
+    for j = 1, #res do out[j] = res[j] end
+
+    local info_rows = {}
+
+    for i = 1, #res do
+        local sql_text = first_sql_text(res[i])
+        if classify_step(sql_text) == 'IMPORT' and count_statement_clauses(sql_text) == 1 then
+            local src_schema, src_table = extract_source_ref_from_import(sql_text)
+            if src_schema ~= nil and src_table ~= nil then
+                local meta = cache.rows[src_schema .. '\t' .. src_table]
+                local rowcount = meta and tonumber(meta.src_rows) or 0
+                if rowcount >= threshold then
+                    local resolved = resolve_parallel_statements(options, rowcount)
+                    local n = resolved.effective
+                    if n >= 2 then
+                        local decision, reason = pick_split_strategy(meta, options, dialect, source_type)
+                        -- Check for soft-fail case (e.g., forced PARTITION on non-partitioned source)
+                        if decision and decision.soft_fail then
+                            append_info_row(info_rows, '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ' -> SINGLE (' .. decision.soft_fail .. ')', state)
+                            decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
+                        elseif decision and decision.soft_fail_info then
+                            -- Emit INFO about the soft-fail but use this decision for splitting
+                            append_info_row(info_rows, '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ': ' .. decision.soft_fail_info, state)
+                            -- Fall through to normal split logic below
+                        end
+                        if decision ~= nil and not decision.soft_fail then
+                            -- Normal split case
+                            local where_per_k = {}
+                            for k = 0, n - 1 do
+                                local w = build_where_for_split(decision, dialect, n, k)
+                                if w ~= nil then
+                                    where_per_k[#where_per_k + 1] = w
+                                end
+                            end
+                            if #where_per_k > 0 then
+                                local rewritten = rewrite_import_to_multi_stmt(sql_text, where_per_k, #where_per_k)
+                                if rewritten ~= nil then
+                                    out[i] = replace_row_sql(out[i], rewritten)
+                                    decisions[i] = { strategy = decision.strategy, key = decision.key, requested = resolved.requested, effective = #where_per_k }
+                                else
+                                    append_info_row(info_rows, '-- PARALLEL_SPLIT: rewrite failed for ' .. src_schema .. '.' .. src_table .. ' -- IMPORT left unchanged', state)
+                                    decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
+                                end
+                            else
+                                append_info_row(info_rows, '-- PARALLEL_SPLIT: WHERE-builder failed for ' .. src_schema .. '.' .. src_table .. ' -- IMPORT left unchanged', state)
+                                decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
+                            end
+                        else
+                            -- decision is nil, use reason for fallthrough
+                            if reason ~= nil then
+                                append_info_row(info_rows, '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ' -> SINGLE (' .. reason .. ')', state)
+                            end
+                            decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
+                        end
+                    else
+                        decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
+                    end
+                else
+                    decisions[i] = { strategy = 'SINGLE', key = nil, requested = requested, effective = 1 }
+                end
+            end
+        end
+    end
+
+    for _, t in ipairs(info_rows) do
+        out[#out + 1] = { SQL_TEXT = t, ERROR_MESSAGE = t:sub(3) }
+    end
+    return out
+end
+
+-- Fills default SINGLE decisions for any IMPORT row neither gate nor splitter
+-- touched (e.g. when the metadata round-trip was skipped or the cache returned
+-- unavailable). Non-IMPORT rows are left without a decision so audit cols stay NULL.
+function transform_for_audit(res, options, decisions, state)
+    if res == nil or #res == 0 then return end
+    decisions = decisions or {}
+    state = state or {}
+    local requested = raw_parallel_requested(options)
+    for i = 1, #res do
+        if decisions[i] == nil then
+            local sql_text = first_sql_text(res[i])
+            if classify_step(sql_text) == 'IMPORT' then
+                local clauses = count_statement_clauses(sql_text)
+                if clauses > 1 then
+                    decisions[i] = { strategy = 'MULTI_PASSTHROUGH', key = nil, requested = requested, effective = clauses }
+                else
+                    decisions[i] = { strategy = 'SINGLE', key = nil, requested = requested, effective = 1 }
+                end
+            end
+        end
+    end
+end
+
+function execute_adapter(adapter_sql, debug, ctx)
+    local success, res = pquery(adapter_sql)
+    if not success then
+        error('"' .. res.error_message .. '" Caught while executing: "' .. res.statement_text .. '"')
+    end
+
+    local state = { has_warnings = false }
+    local decisions = {}
+    if ctx ~= nil then
+        local cache = transform_for_metadata(res, ctx.source_type, ctx.connection_name, ctx.options, state)
+        res = transform_for_gate(res, ctx.options, cache, decisions, state)
+        res = transform_for_split(res, ctx.options, cache, ctx.source_type, decisions, state)
+        transform_for_audit(res, ctx.options, decisions, state)
+    end
+
+    if not debug then
+        return execute_generated_sql(res, decisions, state), OUT_COLUMNS
+    end
+
+    return normalize_rows(res, decisions, state), OUT_COLUMNS
+end
+
+local source = normalize_source_type(SOURCE_TYPE)
+local connection_name = require_value(CONNECTION_NAME, 'CONNECTION_NAME')
+local connection_type = string.upper(blank_to_nil(CONNECTION_TYPE) or 'JDBC')
+local db_filter = blank_to_nil(DB_FILTER) or '%'
+local schema_filter = blank_to_nil(SCHEMA_FILTER) or '%'
+local table_filter = blank_to_nil(TABLE_FILTER) or '%'
+local target_schema = blank_to_nil(TARGET_SCHEMA)
+local identifier_case_insensitive = parse_bool(IDENTIFIER_CASE_INSENSITIVE, true, 'IDENTIFIER_CASE_INSENSITIVE')
+local debug = parse_bool(DEBUG, true, 'DEBUG')
+local options = parse_options(OPTIONS)
+local adapter_schema = blank_to_nil(ADAPTER_SCHEMA) or 'database_migration'
+
+validate_parallel_options(options)
+
+local adapter_sql = nil
+
+if source == 'MYSQL' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.MYSQL_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'DUCKDB' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.DUCKDB_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'STARROCKS' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.STARROCKS_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'CLICKHOUSE' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.CLICKHOUSE_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'DREMIO' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.DREMIO_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'TRINO' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.TRINO_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'MARIADB' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.MARIADB_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'POSTGRES' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.POSTGRES_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ','
+        .. sql_string(target_schema) .. ')'
+
+elseif source == 'REDSHIFT' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.REDSHIFT_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'DB2' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.DB2_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'VERTICA' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.VERTICA_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'HANA' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.HANA_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'AZURE_SQL' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.AZURE_SQL_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ')'
+
+elseif source == 'BIGQUERY' then
+    local project_id = opt(options, 'PROJECT_ID', nil)
+    if blank_to_nil(project_id) == nil and db_filter ~= '%' then
+        project_id = db_filter
+    end
+    project_id = require_value(project_id, 'OPTIONS PROJECT_ID for BIGQUERY')
+
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.BIGQUERY_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(project_id) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'DATABRICKS' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.DATABRICKS_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(opt_bool(options, 'CATALOG2SCHEMA', true)) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(target_schema) .. ','
+        .. sql_string(table_filter) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ')'
+
+elseif source == 'SQLSERVER' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.SQLSERVER_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(opt_bool(options, 'DB2SCHEMA', false)) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(target_schema) .. ','
+        .. sql_string(table_filter) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ')'
+
+elseif source == 'SNOWFLAKE' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.SNOWFLAKE_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(opt_bool(options, 'DB2SCHEMA', false)) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(target_schema) .. ','
+        .. sql_string(table_filter) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ')'
+
+elseif source == 'ORACLE' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.ORACLE_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ','
+        .. resolve_parallel_statements_for_adapter(options, 1) .. ','
+        .. sql_bool(opt_bool(options, 'CREATE_PK', false)) .. ','
+        .. sql_bool(opt_bool(options, 'CREATE_FK', false)) .. ','
+        .. sql_bool(opt_bool(options, 'CHECK_MIGRATION', false)) .. ')'
+
+elseif source == 'TERADATA' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.TERADATA_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ','
+        .. sql_bool(opt_bool(options, 'CHECK_MIGRATION', false)) .. ')'
+
+elseif source == 'EXASOL' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.EXASOL_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_string(connection_type) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ','
+        .. sql_string(opt(options, 'GENERATE_VIEWS', 'FALSE')) .. ','
+        .. sql_string(opt(options, 'VIEW_FILTER', '%')) .. ','
+        .. sql_string(opt(options, 'PK_SETTING', 'DISABLE')) .. ')'
+
+elseif source == 'NETEZZA' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.NETEZZA_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_string(db_filter) .. ','
+        .. sql_string(schema_filter) .. ','
+        .. sql_string(table_filter) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ')'
+
+elseif source == 'VECTORWISE' then
+    adapter_sql = 'EXECUTE SCRIPT ' .. adapter_schema .. '.VECTORWISE_TO_EXASOL('
+        .. sql_string(connection_name) .. ','
+        .. sql_bool(identifier_case_insensitive) .. ','
+        .. sql_string(table_filter) .. ')'
+
+elseif source == 'S3' then
+    error('S3 is not supported by MIGRATE_TO_EXASOL. Use DATABASE_MIGRATION.S3_PARALLEL_READ directly.')
+
+else
+    error('Unsupported SOURCE_TYPE: ' .. tostring(SOURCE_TYPE))
+end
+
+local ctx = {
+    source_type = source,
+    connection_name = connection_name,
+    options = options,
+}
+
+return execute_adapter(adapter_sql, debug, ctx)
+/
+
+/*
+Example:
+
+execute script database_migration.MIGRATE_TO_EXASOL(
+    'SNOWFLAKE',
+    'SNOWFLAKE_CONNECTION',
+    'JDBC',
+    '%',
+    '%',
+    '%',
+    NULL,
+    TRUE,
+    TRUE,
+    'DB2SCHEMA=true'
+);
+*/

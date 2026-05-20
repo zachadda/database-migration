@@ -5,9 +5,11 @@
 
 ## Table of Contents
 1. [Overview](#overview)
-2. [Migration source:](#migration-source)
+2. [Unified migration entry point](#unified-migration-entry-point)
+3. [Migration source:](#migration-source)
     * [Azure Sql](#azure-sql)
     * [CSV](#csv)
+    * [Databricks](#databricks)
     * [DB2](#db2)
     * [Exasol](#exasol)
     * [Google BigQuery](#google-bigquery)
@@ -25,8 +27,8 @@
     * [Vectorwise](#vectorwise)
     * [Vertica](#vertica)
     
-3. [Post-load optimization](#post-load-optimization)
-4. [Delta import](#delta-import)
+4. [Post-load optimization](#post-load-optimization)
+5. [Delta import](#delta-import)
 
 
 ## Overview
@@ -37,6 +39,61 @@ You'll find SQL scripts which you can execute on Exasol to load data from certai
 database management systems. The scripts try to extract the meta data from the source system and create the appropriate IMPORT statements automatically so that you don't have to care about table names, column names and types.
 
 If you want to optimize existing scripts or create new scripts for additional systems, we would be very glad if you share your work with the Exasol user community.
+
+## Unified migration entry point
+
+The script [migrate_to_exasol.sql](migrate_to_exasol.sql) provides one standardized execute interface for the source-specific migration scripts. It dispatches to the existing scripts, so the matching source script still needs to be installed in `DATABASE_MIGRATION`.
+
+`MIGRATE_TO_EXASOL` is a thin orchestrator on top of the per-source adapter scripts: it invokes the adapter exactly as the SE team and existing customers call it directly today, then applies cross-cutting post-processing passes (per-IMPORT row-count threshold, parallel-statement splitter, audit columns) over the rows the adapter returned. Adapter scripts themselves are never modified by the orchestrator — they remain authoritative for source-specific schema discovery, type mapping, identifier quoting, and IMPORT shape. Direct `EXECUTE SCRIPT DATABASE_MIGRATION.<SRC>_TO_EXASOL(...)` callers continue to work byte-for-byte.
+
+```sql
+EXECUTE SCRIPT DATABASE_MIGRATION.MIGRATE_TO_EXASOL(
+    'SNOWFLAKE',                 -- SOURCE_TYPE
+    'SNOWFLAKE_CONNECTION',      -- CONNECTION_NAME
+    'JDBC',                      -- CONNECTION_TYPE
+    '%',                         -- DB_FILTER
+    '%',                         -- SCHEMA_FILTER
+    '%',                         -- TABLE_FILTER
+    NULL,                        -- TARGET_SCHEMA
+    TRUE,                        -- IDENTIFIER_CASE_INSENSITIVE
+    TRUE,                        -- DEBUG: TRUE previews, FALSE executes
+    'DB2SCHEMA=true'             -- OPTIONS
+);
+```
+
+Common parameters:
+- `SOURCE_TYPE`: `MYSQL`, `MARIADB`, `POSTGRES`, `REDSHIFT`, `DB2`, `VERTICA`, `HANA`, `AZURE_SQL`, `BIGQUERY`, `DATABRICKS`, `SQLSERVER`, `SNOWFLAKE`, `ORACLE`, `TERADATA`, `EXASOL`, `NETEZZA`, or `VECTORWISE`.
+- `DEBUG`: `TRUE` returns generated SQL with `RESULT_FLAG = PREVIEW`. `FALSE` executes generated SQL and returns one row per statement plus a trailing `SUMMARY` row.
+- `OPTIONS`: source-specific `KEY=VALUE` pairs separated by semicolons.
+
+The script returns an 11-column audit table:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `STEP_KIND` | `VARCHAR(40)` | `CREATE_SCHEMA`, `CREATE_TABLE`, `ALTER_TABLE`, `IMPORT`, `INFO`, `OTHER`, or `SUMMARY` |
+| `TARGET_OBJ` | `VARCHAR(2000)` | `"SCHEMA"."TABLE"` for table-level steps; schema name for `CREATE_SCHEMA`; `NULL` for `INFO`; rollup text for `SUMMARY` |
+| `ROWS_AFFECTED` | `DECIMAL(18,0)` | rows imported per `IMPORT`; total in `SUMMARY` |
+| `ELAPSED_MS` | `DECIMAL(18,0)` | wall-clock ms per executed statement; total in `SUMMARY` |
+| `RESULT_FLAG` | `VARCHAR(20)` | `PREVIEW`, `OK`, `ERROR`, or `SKIPPED` |
+| `SQL_TEXT` | `VARCHAR(2000000)` | the generated/executed statement (or comment); `NULL` on `SUMMARY` |
+| `ERROR_MESSAGE` | `VARCHAR(20000)` | Exasol error text when `RESULT_FLAG = ERROR` |
+| `SPLIT_STRATEGY` | `VARCHAR(32)` | how the orchestrator decided each `IMPORT` would be parallelized: `PK_RANGE`, `DATE_BUCKET`, `HASH_NUM`, `ROWID`, `SINGLE`, `MULTI_PASSTHROUGH`; `NULL` for non-`IMPORT` rows |
+| `SPLIT_KEY` | `VARCHAR(256)` | column or pseudo-column used as the parallel selector (`ORDER_ID`, `ctid`, `%%physloc%%`); `NULL` for `SINGLE`, `MULTI_PASSTHROUGH`, and non-`IMPORT` rows |
+| `PARALLEL_REQUESTED` | `VARCHAR(16)` | raw `PARALLEL_STATEMENTS` value (`AUTO`, `8`, …); `NULL` for non-`IMPORT` rows |
+| `PARALLEL_EFFECTIVE` | `DECIMAL(4,0)` | number of `statement '...'` clauses actually emitted after the threshold gate and splitter resolved; `NULL` for non-`IMPORT` rows |
+
+Useful `OPTIONS` keys:
+- `PROJECT_ID`: required for `BIGQUERY` unless `DB_FILTER` contains the project ID.
+- `CATALOG2SCHEMA`: `true` or `false` for `DATABRICKS`.
+- `DB2SCHEMA`: `true` or `false` for `SNOWFLAKE` and `SQLSERVER`.
+- `CREATE_PK`, `CREATE_FK`, `CHECK_MIGRATION`: Oracle/Teradata options.
+- `GENERATE_VIEWS`, `VIEW_FILTER`, `PK_SETTING`: Exasol-to-Exasol options.
+- `PARALLEL_STATEMENTS`: `AUTO` (default) or a positive integer. `AUTO` resolves to `min(PARALLEL_AUTO_CEILING, max(1, ceil(src_rows / 5_000_000)))` per table; explicit integers bypass the ceiling. Affects every adapter that emits single-statement `IMPORT`s.
+- `PARALLEL_ROW_THRESHOLD`: positive integer (default `1000000`). The orchestrator collapses multi-statement IMPORTs whose source row count is below this threshold and only fires the splitter on single-statement IMPORTs whose source row count is at-or-above it. `0` disables the gate.
+- `PARALLEL_SPLIT`: `AUTO` (default), `OFF`, `PK`, `DATE[:col[:grain]]`, `HASH:col`, `ROWID`, or `PARTITION`. Forces one step of the parallel-split hierarchy (or disables it via `OFF`); `AUTO` walks the hierarchy stopping at the first usable strategy.
+- `PARALLEL_AUTO_CEILING`: positive integer (default `12`). Per-table cap for `PARALLEL_STATEMENTS=AUTO`. Raise for sources with deep connection pools; explicit `PARALLEL_STATEMENTS=N` ignores it.
+
+The S3 parallel loader keeps its direct script interface because it uses a different parameter shape; calling `MIGRATE_TO_EXASOL` with `SOURCE_TYPE = 'S3'` raises an explicit error pointing at `DATABASE_MIGRATION.S3_PARALLEL_READ`.
 
 ## Migration source
 
@@ -111,6 +168,37 @@ FROM   (
 For the actual data-migration, see script [bigquery_to_exasol.sql](bigquery_to_exasol.sql)
 
 Note: Due to the lack of an alternative datatype, the following Google BigQuery datatypes; `DATE`,`DATETIME`,`TIMESTAMP` and `ARRAY` are stored as VARCHAR. 
+
+### Databricks
+
+To connect Exasol to Databricks, configure the Databricks JDBC driver in Exasol with the driver name `DATABRICKS`, then create a connection for your Databricks SQL warehouse. The JDBC URL requires your server hostname and HTTP path. See the [Databricks JDBC driver documentation](https://docs.databricks.com/aws/en/integrations/jdbc-oss/configure) for current connection details.
+
+Example connection:
+
+```sql
+CREATE OR REPLACE CONNECTION DATABRICKS_CONNECTION TO
+  'jdbc:databricks://<server-hostname>:443/default;httpPath=<http-path>;AuthMech=3;UseNativeQuery=1'
+  USER 'token'
+  IDENTIFIED BY '<personal-access-token>';
+```
+
+Create the script [databricks_to_exasol.sql](databricks_to_exasol.sql), then generate migration SQL:
+
+```sql
+EXECUTE SCRIPT DATABASE_MIGRATION.DATABRICKS_TO_EXASOL(
+    'DATABRICKS_CONNECTION', -- CONNECTION_NAME
+    TRUE,                    -- CATALOG2SCHEMA: catalog.schema.table -> catalog.schema_table
+    '%',                     -- CATALOG_FILTER
+    '%',                     -- SCHEMA_FILTER
+    NULL,                    -- TARGET_SCHEMA
+    '%',                     -- TABLE_FILTER
+    TRUE                     -- IDENTIFIER_CASE_INSENSITIVE
+);
+```
+
+The script uses Databricks `INFORMATION_SCHEMA` metadata to generate `CREATE SCHEMA`, `CREATE TABLE`, and `IMPORT FROM JDBC DRIVER = 'DATABRICKS'` statements for managed and external tables. `CATALOG2SCHEMA` helps avoid name collisions when multiple Databricks catalogs contain the same schema and table names.
+
+S3 loading is intentionally not part of this adapter. Use [s3_to_exasol.sql](s3_to_exasol.sql) for S3 parallel loading.
 
 
 ### MariaDB
