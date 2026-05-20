@@ -63,6 +63,7 @@ local function run_migrate(params)
         IDENTIFIER_CASE_INSENSITIVE = params.identifier_case_insensitive,
         DEBUG = params.debug,
         OPTIONS = params.options,
+        ADAPTER_SCHEMA = params.adapter_schema,
         string = string,
         table = table,
         math = math,
@@ -388,6 +389,65 @@ test("Errors mark RESULT_FLAG ERROR and SUMMARY ERROR", function()
     assert_eq(result.rows[1][7], "boom")
     assert_eq(result.rows[2][1], "SUMMARY")
     assert_eq(result.rows[2][5], "ERROR")
+end)
+
+print("")
+print("=== ADAPTER_SCHEMA and Summary Warnings Tests ===")
+
+test("ADAPTER_SCHEMA changes EXECUTE SCRIPT target in dispatch", function()
+    local result = run_migrate({
+        source_type = "MYSQL",
+        schema_filter = "SCH",
+        table_filter = "TBL",
+        adapter_schema = "custom_migration",
+        debug = true,
+    })
+    assert_eq(result.adapter_sql, "EXECUTE SCRIPT custom_migration.MYSQL_TO_EXASOL('SRC_CONN',TRUE,'SCH','TBL')")
+end)
+
+test("ADAPTER_SCHEMA preserves adapter parameter order in dispatch", function()
+    local result = run_migrate({
+        source_type = "ORACLE",
+        schema_filter = "SCH",
+        table_filter = "TBL",
+        adapter_schema = "custom_schema",
+        options = "PARALLEL_STATEMENTS=4;CREATE_PK=true",
+        debug = true,
+    })
+    assert_eq(result.adapter_sql, "EXECUTE SCRIPT custom_schema.ORACLE_TO_EXASOL('SRC_CONN',TRUE,'SCH','TBL',4,TRUE,FALSE,FALSE)")
+end)
+
+test("INFO rows append warning text to SUMMARY in preview mode", function()
+    local result = run_migrate({
+        source_type = "ORACLE",
+        debug = true,
+        options = "PARALLEL_ROW_THRESHOLD=1000",
+        adapter_rows = {
+            {SQL_TEXT = "import into (c int) from jdbc at db statement 'select * from src.t'"},
+        },
+        gate_lookup_error = "ORA-00942: table or view does not exist",
+    })
+    local summary = result.rows[#result.rows]
+    assert_eq(summary[1], "SUMMARY")
+    assert_eq(summary[5], "PREVIEW")
+    assert_contains(summary[2], "(completed with warnings)")
+end)
+
+test("INFO rows append warning text to SUMMARY in execute mode", function()
+    local result = run_migrate({
+        source_type = "ORACLE",
+        debug = false,
+        options = "PARALLEL_ROW_THRESHOLD=1000",
+        adapter_rows = {
+            {SQL_TEXT = "import into (c int) from jdbc at db statement 'select * from src.t'"},
+        },
+        gate_lookup_error = "ORA-00942: table or view does not exist",
+        execute_results = {[1] = {success = true, rows_affected = nil}},
+    })
+    local summary = result.rows[#result.rows]
+    assert_eq(summary[1], "SUMMARY")
+    assert_eq(summary[5], "OK")
+    assert_contains(summary[2], "(completed with warnings)")
 end)
 
 print("")

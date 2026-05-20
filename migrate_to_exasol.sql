@@ -250,8 +250,17 @@ function build_row(step_kind, target_obj, rows_affected, elapsed_ms, result_flag
     return {step_kind, target_obj, rows_affected, elapsed_ms, result_flag, sql_text, error_message, strategy, key, requested, effective}
 end
 
-function normalize_rows(res, decisions)
+function append_info_row(info_rows, text, state)
+    info_rows[#info_rows + 1] = text
+    if state then
+        state.has_warnings = true
+    end
+end
+
+
+function normalize_rows(res, decisions, state)
     decisions = decisions or {}
+    state = state or {}
     local summary = {}
     local tables_count = 0
     for i = 1, #res do
@@ -266,12 +275,17 @@ function normalize_rows(res, decisions)
         local err = row.ERROR_MESSAGE or row[7] or row[3] or NULL
         summary[#summary + 1] = build_row(kind, target, NULL, NULL, flag, sql_text, err, decisions[i])
     end
-    summary[#summary + 1] = build_row('SUMMARY', 'Plan: ' .. tables_count .. ' table(s) to create', NULL, NULL, 'PREVIEW', NULL, NULL)
+    local summary_text = 'Plan: ' .. tables_count .. ' table(s) to create'
+    if state.has_warnings then
+        summary_text = summary_text .. ' (completed with warnings)'
+    end
+    summary[#summary + 1] = build_row('SUMMARY', summary_text, NULL, NULL, 'PREVIEW', NULL, NULL)
     return summary
 end
 
-function execute_generated_sql(res, decisions)
+function execute_generated_sql(res, decisions, state)
     decisions = decisions or {}
+    state = state or {}
     local summary = {}
     local fail_count = 0
     local executed_count = 0
@@ -322,6 +336,9 @@ function execute_generated_sql(res, decisions)
     else
         summary_obj = 'Completed with ' .. fail_count .. ' error(s); ' .. tables_created .. ' table(s) created, ' .. total_rows .. ' row(s) loaded'
         summary_flag = 'ERROR'
+    end
+    if state.has_warnings then
+        summary_obj = summary_obj .. ' (completed with warnings)'
     end
     summary[#summary + 1] = build_row('SUMMARY', summary_obj, total_rows, total_elapsed, summary_flag, NULL, NULL)
 
@@ -926,7 +943,7 @@ function merge_minmax_into_cache(cache_rows, minmax_rows, source_type)
     end
 end
 
-function transform_for_metadata(res, source_type, connection_name, options)
+function transform_for_metadata(res, source_type, connection_name, options, state)
     local empty = { available = false, rows = {}, info_rows = {} }
     if res == nil or #res == 0 then return empty end
 
@@ -941,10 +958,12 @@ function transform_for_metadata(res, source_type, connection_name, options)
         else
             reason = dispatch.reason or 'metadata skipped'
         end
+        local info_rows = {}
+        append_info_row(info_rows, '-- PARALLEL_ROW_THRESHOLD gate skipped: ' .. reason, state)
         return {
             available = false,
             rows = {},
-            info_rows = { '-- PARALLEL_ROW_THRESHOLD gate skipped: ' .. reason },
+            info_rows = info_rows,
         }
     end
 
@@ -970,7 +989,7 @@ function transform_for_metadata(res, source_type, connection_name, options)
             if not success then
                 -- Per-dataset failure: emit INFO row with error, populate NULL rows for this dataset's tables.
                 local err_msg = (lookup_res and lookup_res.error_message) or 'unknown error'
-                info_rows[#info_rows + 1] = '-- PARALLEL_ROW_THRESHOLD gate: BigQuery metadata lookup failed for dataset ' .. dataset .. ': ' .. err_msg
+                append_info_row(info_rows, '-- PARALLEL_ROW_THRESHOLD gate: BigQuery metadata lookup failed for dataset ' .. dataset .. ': ' .. err_msg, state)
                 for _, pair in ipairs(table_pairs) do
                     local key = pair.schema .. '\t' .. pair.table_name
                     merged_rows[key] = {
@@ -1011,10 +1030,12 @@ function transform_for_metadata(res, source_type, connection_name, options)
     local success, lookup_res = pquery(outer_sql)
     if not success then
         local err = (lookup_res and lookup_res.error_message) or 'unknown error'
+        local info_rows = {}
+        append_info_row(info_rows, '-- PARALLEL_ROW_THRESHOLD gate skipped: row-count lookup failed (' .. tostring(err) .. ')', state)
         return {
             available = false,
             rows = {},
-            info_rows = { '-- PARALLEL_ROW_THRESHOLD gate skipped: row-count lookup failed (' .. tostring(err) .. ')' },
+            info_rows = info_rows,
         }
     end
 
@@ -1045,26 +1066,26 @@ function transform_for_metadata(res, source_type, connection_name, options)
                     -- Soft-fail: wrap in pcall to catch permission-denied, table-missing, etc.
                     local minmax_pcall_ok, minmax_query_success, minmax_lookup_res = pcall(pquery, minmax_outer_sql)
 
-                    if minmax_pcall_ok then
-                        -- pcall succeeded, so minmax_query_success is the bool from pquery
-                        if minmax_query_success then
-                            -- LEFT JOIN min/max into cache rows
-                            merge_minmax_into_cache(rows, minmax_lookup_res, source_type)
+                        if minmax_pcall_ok then
+                            -- pcall succeeded, so minmax_query_success is the bool from pquery
+                            if minmax_query_success then
+                                -- LEFT JOIN min/max into cache rows
+                                merge_minmax_into_cache(rows, minmax_lookup_res, source_type)
+                            else
+                                -- Min/max query failed; emit INFO row for each table that had a numeric PK
+                                local err = (minmax_lookup_res and minmax_lookup_res.error_message) or 'unknown error'
+                                for _, tuple in ipairs(minmax_tuples) do
+                                    append_info_row(info_rows, '-- second-pass min/max round-trip failed for ' .. tuple.schema .. '.' .. tuple.table .. ': ' .. tostring(err), state)
+                                end
+                            end
                         else
-                            -- Min/max query failed; emit INFO row for each table that had a numeric PK
-                            local err = (minmax_lookup_res and minmax_lookup_res.error_message) or 'unknown error'
+                            -- pcall itself failed (should not happen in normal operation)
+                            local pcall_err = tostring(minmax_query_success)  -- second arg is error message
                             for _, tuple in ipairs(minmax_tuples) do
-                                info_rows[#info_rows + 1] = '-- second-pass min/max round-trip failed for ' .. tuple.schema .. '.' .. tuple.table .. ': ' .. tostring(err)
+                                append_info_row(info_rows, '-- second-pass min/max round-trip error for ' .. tuple.schema .. '.' .. tuple.table .. ': ' .. pcall_err, state)
                             end
                         end
-                    else
-                        -- pcall itself failed (should not happen in normal operation)
-                        local pcall_err = tostring(minmax_query_success)  -- second arg is error message
-                        for _, tuple in ipairs(minmax_tuples) do
-                            info_rows[#info_rows + 1] = '-- second-pass min/max round-trip error for ' .. tuple.schema .. '.' .. tuple.table .. ': ' .. pcall_err
-                        end
                     end
-                end
             end
         end
     end
@@ -1084,9 +1105,10 @@ end
 -- populated by `transform_for_metadata`; never issues its own source-side query.
 -- Writes a decision record per multi-statement IMPORT row it touches so the
 -- audit transform can later populate SPLIT_STRATEGY / PARALLEL_EFFECTIVE.
-function transform_for_gate(res, options, cache, decisions)
+function transform_for_gate(res, options, cache, decisions, state)
     if res == nil or #res == 0 then return res end
     decisions = decisions or {}
+    state = state or {}
 
     local threshold = parse_threshold(options)
     local requested = raw_parallel_requested(options)
@@ -1662,9 +1684,10 @@ end
 -- IMPORTs are left untouched (the adapter already chose its split). Any failure
 -- inside the splitter logs an INFO row and leaves the IMPORT unchanged - the
 -- splitter is an optimization and MUST NOT break a migration.
-function transform_for_split(res, options, cache, source_type, decisions)
+function transform_for_split(res, options, cache, source_type, decisions, state)
     if res == nil or #res == 0 then return res end
     decisions = decisions or {}
+    state = state or {}
 
     local directive_ok, directive = pcall(parse_split_directive, options)
     if not directive_ok then return res end
@@ -1694,11 +1717,11 @@ function transform_for_split(res, options, cache, source_type, decisions)
                         local decision, reason = pick_split_strategy(meta, options, dialect, source_type)
                         -- Check for soft-fail case (e.g., forced PARTITION on non-partitioned source)
                         if decision and decision.soft_fail then
-                            info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ' -> SINGLE (' .. decision.soft_fail .. ')'
+                            append_info_row(info_rows, '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ' -> SINGLE (' .. decision.soft_fail .. ')', state)
                             decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
                         elseif decision and decision.soft_fail_info then
                             -- Emit INFO about the soft-fail but use this decision for splitting
-                            info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ': ' .. decision.soft_fail_info
+                            append_info_row(info_rows, '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ': ' .. decision.soft_fail_info, state)
                             -- Fall through to normal split logic below
                         end
                         if decision ~= nil and not decision.soft_fail then
@@ -1716,17 +1739,17 @@ function transform_for_split(res, options, cache, source_type, decisions)
                                     out[i] = replace_row_sql(out[i], rewritten)
                                     decisions[i] = { strategy = decision.strategy, key = decision.key, requested = resolved.requested, effective = #where_per_k }
                                 else
-                                    info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: rewrite failed for ' .. src_schema .. '.' .. src_table .. ' -- IMPORT left unchanged'
+                                    append_info_row(info_rows, '-- PARALLEL_SPLIT: rewrite failed for ' .. src_schema .. '.' .. src_table .. ' -- IMPORT left unchanged', state)
                                     decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
                                 end
                             else
-                                info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: WHERE-builder failed for ' .. src_schema .. '.' .. src_table .. ' -- IMPORT left unchanged'
+                                append_info_row(info_rows, '-- PARALLEL_SPLIT: WHERE-builder failed for ' .. src_schema .. '.' .. src_table .. ' -- IMPORT left unchanged', state)
                                 decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
                             end
                         else
                             -- decision is nil, use reason for fallthrough
                             if reason ~= nil then
-                                info_rows[#info_rows + 1] = '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ' -> SINGLE (' .. reason .. ')'
+                                append_info_row(info_rows, '-- PARALLEL_SPLIT: ' .. src_schema .. '.' .. src_table .. ' -> SINGLE (' .. reason .. ')', state)
                             end
                             decisions[i] = { strategy = 'SINGLE', key = nil, requested = resolved.requested, effective = 1 }
                         end
@@ -1749,9 +1772,10 @@ end
 -- Fills default SINGLE decisions for any IMPORT row neither gate nor splitter
 -- touched (e.g. when the metadata round-trip was skipped or the cache returned
 -- unavailable). Non-IMPORT rows are left without a decision so audit cols stay NULL.
-function transform_for_audit(res, options, decisions)
+function transform_for_audit(res, options, decisions, state)
     if res == nil or #res == 0 then return end
     decisions = decisions or {}
+    state = state or {}
     local requested = raw_parallel_requested(options)
     for i = 1, #res do
         if decisions[i] == nil then
@@ -1774,19 +1798,20 @@ function execute_adapter(adapter_sql, debug, ctx)
         error('"' .. res.error_message .. '" Caught while executing: "' .. res.statement_text .. '"')
     end
 
+    local state = { has_warnings = false }
     local decisions = {}
     if ctx ~= nil then
-        local cache = transform_for_metadata(res, ctx.source_type, ctx.connection_name, ctx.options)
-        res = transform_for_gate(res, ctx.options, cache, decisions)
-        res = transform_for_split(res, ctx.options, cache, ctx.source_type, decisions)
-        transform_for_audit(res, ctx.options, decisions)
+        local cache = transform_for_metadata(res, ctx.source_type, ctx.connection_name, ctx.options, state)
+        res = transform_for_gate(res, ctx.options, cache, decisions, state)
+        res = transform_for_split(res, ctx.options, cache, ctx.source_type, decisions, state)
+        transform_for_audit(res, ctx.options, decisions, state)
     end
 
     if not debug then
-        return execute_generated_sql(res, decisions), OUT_COLUMNS
+        return execute_generated_sql(res, decisions, state), OUT_COLUMNS
     end
 
-    return normalize_rows(res, decisions), OUT_COLUMNS
+    return normalize_rows(res, decisions, state), OUT_COLUMNS
 end
 
 local source = normalize_source_type(SOURCE_TYPE)
